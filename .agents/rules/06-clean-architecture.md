@@ -12,9 +12,9 @@ Para garantir que o MCP Rust Star seja escalável e fácil de manter, seguimos u
 - **Responsabilidade**: Orquestrar o pipeline de RAG (embeddings, busca, geração).
 - **Regra**: Deve ser independente da interface. Se decidirmos trocar o MCP por uma API REST no futuro, esta camada deve permanecer intocada.
 
-### Camada de Persistência (Vector Store) - `src/vector_store.py`
-- **Responsabilidade**: Abstrair o ChromaDB e operações de persistência de projetos.
-- **Regra**: Nenhuma outra camada deve conhecer os detalhes internos do ChromaDB.
+### Camada de Persistência (Vector Store) - `src/vector_store_postgres.py`
+- **Responsabilidade**: Abstrair o PostgreSQL e operações de persistência de projetos.
+- **Regra**: Nenhuma outra camada deve conhecer os detalhes internos do SQL ou pgvector.
 
 ---
 
@@ -27,3 +27,10 @@ Para garantir que o MCP Rust Star seja escalável e fácil de manter, seguimos u
 ## 3. Isolamento de Domínio
 - Os dados de diferentes projetos (Rust Star vs FoxOT) devem ser tratados como domínios isolados.
 - **Segurança**: Nunca permitir que uma consulta de um projeto acesse metadados de outro, a menos que explicitamente solicitado via ferramenta de administração.
+
+---
+
+## 4. Shared State e Telemetria
+- O servidor MCP e o Dashboard utilizam um padrão de **Estado Compartilhado** via arquivo JSON (`data/current_indexing.json`).
+- **Unidirecionalidade**: O `RAGService` é o único que escreve no estado. O Dashboard apenas lê. Isso evita condições de corrida e garante a integridade dos dados de monitoramento.
+- **Ponte de Logs**: O dashboard deve ler o `mcp_error.log` de forma não-bloqueante para exibir o terminal de eventos em tempo real.

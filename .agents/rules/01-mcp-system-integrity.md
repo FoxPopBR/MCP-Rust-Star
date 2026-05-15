@@ -33,5 +33,12 @@ O servidor MCP é extremamente sensível à integridade da comunicação via STD
 
 ---
 
-## 4. Evolução da Base de Conhecimento
+## 4. Integridade de Persistência SQL
+
+Com a migração para o **PostgreSQL + pgvector**, a disciplina com os dados foi elevada:
+- **Isolamento de Tabelas**: Cada projeto deve ter sua própria tabela (`knowledge_[project_id]`). NUNCA misture dados de projetos diferentes em uma tabela global.
+- **Validação de Vetores**: Antes de gravar, o sistema deve garantir que as dimensões do embedding (ex: 4096) batem com a configuração da tabela.
+- **Transacionalidade**: Operações massivas devem ser feitas em lotes (batch) para otimizar o I/O do banco.
+
+## 5. Evolução da Base de Conhecimento
 - Toda vez que uma "gambiarra" for detectada ou um bug complexo for resolvido, uma nova **Skill** deve ser criada em `.agents/skills/` para documentar o aprendizado e evitar a reincidência.

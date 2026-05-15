@@ -4,7 +4,7 @@ Esta skill ensina como aplicar filosofias de engenharia de alto nível no contex
 
 ## 1. Aplicação da Linguagem Ubíqua
 Ao receber um comando vago, use o `CONTEXT.md` para traduzir o desejo do usuário em termos técnicos precisos.
-- **Ação**: Se o usuário diz "arruma o banco", você pergunta: "Você se refere a limpar a coleção do ChromaDB para o projeto FoxOT ou otimizar a persistência em `data/`?"
+- **Ação**: Se o usuário diz "arruma o banco", você pergunta: "Você se refere a limpar a tabela do PostgreSQL para o projeto FoxOT ou otimizar a persistência em `data/`?"
 
 ## 2. Execução da Sabatina (Grilling)
 Sempre que uma nova funcionalidade for solicitada:
@@ -13,7 +13,7 @@ Sempre que uma nova funcionalidade for solicitada:
 3.  Aguarde o alinhamento antes de codificar.
 
 ## 3. Operação do Loop de Diagnóstico
-Ao encontrar um erro de conexão com o Ollama ou falha no ChromaDB:
+Ao encontrar um erro de conexão com o Ollama ou falha no PostgreSQL:
 - Não "chute" a solução.
 - Aumente o nível do `logger` para DEBUG.
 - Capture a saída do `stderr`.
@@ -21,3 +21,7 @@ Ao encontrar um erro de conexão com o Ollama ou falha no ChromaDB:
 
 ## 4. Gestão de ADRs
 Ao sugerir uma mudança (ex: "vamos usar FastAPI"), crie automaticamente o rascunho do ADR em `docs/adr/` explicando o raciocínio. Isso evita que o projeto se torne uma colcha de retalhos de decisões esquecidas.
+
+## 5. Escrita Incremental e Continuidade
+- **Documentação por Estágios**: Para evitar "vibe-summaries" genéricos, construa documentos extensos (ex: ARCHITECTURE.md) em estágios lógicos ao longo de vários turnos.
+- **Protocolo de Diário**: Nunca encerre um grande ciclo sem atualizar o `docs/SESSION_LOG.md`. Este é o seu "farol" para a próxima sessão, garantindo que o agente sucessor não comece do zero.

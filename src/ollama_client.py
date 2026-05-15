@@ -1,5 +1,6 @@
 import ollama
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -32,24 +33,26 @@ class OllamaClient:
         self.base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         self.embedding_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:4b")
         self.rag_model = os.getenv("RAG_MODEL", "qwen3.5:4b")
-        # Janela de contexto calibrada: 12k tokens (~5.9GB VRAM footprint)
-        self.num_ctx = int(os.getenv("NUM_CTX", "12288"))
+        # Janela de contexto calibrada: 12k tokens (~5.9GB VRAM footprint para Qwen 4b)
+        self.num_ctx = 12288
 
         try:
             self.client = ollama.Client(host=self.base_url)
             logger.info(
-                f"OllamaClient conectado a {self.base_url}. Modelos: {self.embedding_model}, {self.rag_model}"
+                f"OllamaClient conectado. Modelos: {self.embedding_model}, {self.rag_model} | Contexto: {self.num_ctx}"
             )
         except Exception as e:
             logger.critical(f"Falha ao instanciar OllamaClient ({self.base_url}): {str(e)}")
             raise
 
     def get_embedding(self, text: str, auto_unload: bool = False) -> list:
-        """Gera embedding vetorial para o texto. auto_unload=True libera VRAM após chamada única."""
+        """Gera embedding vetorial para o texto com timeout de 60s e num_ctx fixo."""
         try:
+            # timeout em segundos para evitar travamentos
             response = self.client.embeddings(
                 model=self.embedding_model,
                 prompt=text,
+                options={"timeout": 60, "num_ctx": self.num_ctx}
             )
             if auto_unload:
                 self._unload_model(self.embedding_model, is_chat=False)
@@ -59,11 +62,9 @@ class OllamaClient:
             raise
 
     def generate_response(self, question: str, context: str = "", project_id: str = None) -> str:
-        """Gera resposta RAG com system prompt especializado em código. Libera VRAM após uso."""
+        """Gera resposta RAG com timeout de 90s e num_ctx fixo."""
         try:
             project_label = project_id if project_id else "Todos os Projetos"
-
-            # Monta o prompt do usuário com contexto estruturado
             user_content = f"[Escopo da Consulta: {project_label}]\n\n"
 
             if context.strip():
@@ -73,7 +74,7 @@ class OllamaClient:
 
             user_content += f"Pergunta: {question}"
 
-            logger.debug(f"Enviando prompt RAG para {self.rag_model} (Projeto: {project_label})")
+            logger.debug(f"Enviando prompt RAG para {self.rag_model}")
 
             response = self.client.chat(
                 model=self.rag_model,
@@ -81,10 +82,9 @@ class OllamaClient:
                     {"role": "system", "content": _SYSTEM_PROMPT_CODE},
                     {"role": "user",   "content": user_content},
                 ],
-                options={"num_ctx": self.num_ctx},
+                options={"num_ctx": self.num_ctx, "timeout": 90},
             )
 
-            # Liberação de VRAM após geração
             self._unload_model(self.rag_model, is_chat=True)
             return response["message"]["content"]
 
@@ -167,16 +167,24 @@ class OllamaClient:
             return ""
 
     def _unload_model(self, model_name: str, is_chat: bool) -> None:
-        """Envia keep_alive=0 para liberar o modelo da VRAM imediatamente."""
+        """Envia keep_alive=0 para liberar o modelo da VRAM imediatamente com timeout de 30s."""
         try:
+            start_time = time.time()
             if is_chat:
                 self.client.chat(
                     model=model_name,
                     messages=[{"role": "user", "content": ""}],
-                    keep_alive=0
+                    keep_alive=0,
+                    options={"num_ctx": 1, "timeout": 30}
                 )
             else:
-                self.client.generate(model=model_name, prompt="", keep_alive=0)
-            logger.info(f"Modelo {model_name} descarregado (keep_alive=0 enviado).")
+                self.client.generate(
+                    model=model_name, 
+                    prompt="", 
+                    keep_alive=0,
+                    options={"timeout": 30}
+                )
+            duration = time.time() - start_time
+            logger.info(f"Modelo {model_name} descarregado em {duration:.2f}s (keep_alive=0 enviado).")
         except Exception as e:
             logger.debug(f"Aviso ao descarregar {model_name}: {str(e)}")

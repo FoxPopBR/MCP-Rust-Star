@@ -13,7 +13,8 @@ O servidor utiliza uma arquitetura de **Alta Fidelidade**. Para detalhes técnic
 
 - **Banco de Dados**: PostgreSQL com extensão `pgvector`.
 - **Inteligência**: Ollama local (qwen3-embedding:4b e qwen3.5:4b).
-- **Memória**: Janela calibrada de **12.288 tokens** (5.9GB VRAM footprint).
+- **Monitoramento**: Dashboard em tempo real via `dashboard.bat` (UI Rich no Terminal).
+- **Memória**: Janela calibrada de **12.288 tokens** (Equilíbrio VRAM/Precisão).
 
 ### 🔄 Protocolo de Boot (Auto-Cura)
 Execute sempre via `run_server.bat`. O script realiza:
@@ -86,9 +87,10 @@ Você pode ajustar estes valores via `update_server_settings`:
 
 ## 🛡️ 5. Protocolos de Segurança e Performance
 
-- **Zero-Waste VRAM**: O sistema garante que após cada tarefa, a memória de vídeo seja devolvida ao Windows.
+- **Zero-Waste VRAM**: O sistema garante que após cada tarefa, a memória de vídeo seja devolvida ao Windows via `unload_vram`.
+- **Estabilidade por Subdivisão**: Arquivos que saturam a VRAM são automaticamente divididos em fragmentos menores e re-indexados recursivamente.
 - **Isolamento de Contexto**: Nunca responda uma pergunta de um projeto usando dados de outro sem permissão.
-- **Integridade de Log**: Se algo falhar, consulte `logs/mcp_error.log`. Ele usa rotação automática de 10MB para não lotar seu disco.
+- **Integridade de Log**: Se algo falhar, consulte `logs/mcp_error.log` ou acompanhe o **Terminal de Eventos** no Dashboard.
 
 ---
 *Este manual é um artefato de Engenharia de Elite. Siga-o para garantir a soberania do conhecimento no ecossistema Rust Star.*

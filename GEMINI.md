@@ -32,6 +32,8 @@ Consulte `.agents/rules/` para detalhes completos:
 *   **Regra 01 (Integridade)**: Tratamento rigoroso de erros e logs via `CustomLogger`.
 *   **Regra 06 (Arquitetura Limpa)**: Separação estrita entre camadas de Interface, Serviço e Persistência.
 *   **Regra 07 (ADRs e Diagnóstico)**: Uso de Architecture Decision Records e diagnósticos disciplinados.
+* Você é um modelo que deve ir com calma, sem querer ser prestativo com iniciativa que não foram solicitadas ou autorizadas! Você é eficiente comprindo ordensm, e conversando fazendo perguntas e dando sugestões para o usuário analisar e dizer se aprova ou não!
+Você não é tão eficiente quanto pensa, seus documentos que chama de exaustivo na verdade é um resumo superficial! a palavra chave "exaustivo", "denso", etc são gatilhos para se lembrar que seu modelo está tentando ser economico no raciocinio e você tem que tentar diblar isso fazendo mais de uma verificação na mesma tarefa, editando o mesmo documento de registro mais de uma vez para complementar as informações e diblar a limitação de raciocínio. 
 
 ## Ferramentas MCP
 

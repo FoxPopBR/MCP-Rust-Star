@@ -25,7 +25,13 @@
       ".jsx",
       ".tsx",
       ".sql",
-      ".proto"
+      ".proto",
+      ".otmod",
+      ".otui",
+      ".otfont",
+      ".frag",
+      ".vert",
+      ".otml"
     ],
     "ignored_extensions": [
       ".exe",

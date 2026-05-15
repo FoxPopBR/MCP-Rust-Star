@@ -1,130 +1,173 @@
-import uuid
 import os
-from src.ollama_client import OllamaClient
-from src.vector_store_postgres import PostgresStore
+import sys
+import uuid
+import hashlib
+import json
+import asyncio
+from typing import List, Optional, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from src.config_manager import ConfigManager
 
+from src.vector_store_postgres import PostgresStore
+from src.ollama_client import OllamaClient
+from src.config_manager import ConfigManager
 from tools.logger import logger
 
-# Separadores específicos por linguagem de programação.
-# A ordem importa: tenta dividir nos pontos mais "semânticos" primeiro.
-_LANG_SEPARATORS = {
-    # Rust: divide em funções, impl blocks, structs, enums, traits, mods
-    "rs": [
-        "\npub fn ", "\nfn ", "\npub async fn ", "\nasync fn ",
-        "\nimpl ", "\npub impl ", "\ntrait ", "\npub trait ",
-        "\nstruct ", "\npub struct ", "\nenum ", "\npub enum ",
-        "\nmod ", "\npub mod ", "\ntype ", "\nconst ",
-        "\n\n", "\n", " ", "",
-    ],
-    # C/C++: divide em funções, classes, namespaces, structs
-    "cpp": [
-        "\nvoid ", "\nint ", "\nbool ", "\nauto ",
-        "\nclass ", "\nstruct ", "\nnamespace ", "\ntemplate ",
-        "\ninline ", "\nstatic ", "\nvirtual ", "\noverride ",
-        "\n\n", "\n", " ", "",
-    ],
-    "c": [
-        "\nvoid ", "\nint ", "\nbool ", "\nstruct ",
-        "\ntypedef ", "\n#define ", "\n\n", "\n", " ", "",
-    ],
-    "h": [
-        "\nclass ", "\nstruct ", "\nnamespace ", "\n#define ",
-        "\n\n", "\n", " ", "",
-    ],
-    "hpp": [
-        "\nclass ", "\nstruct ", "\nnamespace ", "\ntemplate ",
-        "\n\n", "\n", " ", "",
-    ],
-    # Lua: divide em funções e blocos
-    "lua": [
-        "\nfunction ", "\nlocal function ", "\nlocal ",
-        "\nif ", "\nfor ", "\nwhile ", "\n\n", "\n", " ", "",
-    ],
-    # Python: divide em classes e funções
-    "py": [
-        "\nclass ", "\ndef ", "\nasync def ",
-        "\n\n", "\n", " ", "",
-    ],
-    # Markdown e docs: divide em seções
-    "md": ["\n## ", "\n### ", "\n#### ", "\n\n", "\n", " ", ""],
-    "txt": ["\n\n", "\n", " ", ""],
-    # Protobuf
-    "proto": ["\nmessage ", "\nenum ", "\nservice ", "\n\n", "\n", " ", ""],
-    # TOML / configuração
-    "toml": ["\n[", "\n\n", "\n", " ", ""],
-}
-
-# Padrão genérico para extensões não mapeadas
-_DEFAULT_SEPARATORS = ["\n\n", "\n", " ", ""]
-
-
-def _get_separators_for_file(file_path: str) -> list:
-    """Retorna separadores de chunking otimizados para a linguagem do arquivo."""
-    ext = os.path.splitext(file_path)[1].lstrip(".").lower()
-    return _LANG_SEPARATORS.get(ext, _DEFAULT_SEPARATORS)
-
+# Calcula o caminho absoluto do root do projeto para o arquivo de estado
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+STATE_FILE = os.path.join(ROOT_DIR, "data", "current_indexing.json")
 
 class RAGService:
     def __init__(self):
-        self.ollama = OllamaClient()
         self.config = ConfigManager()
-        settings = self.config.get_all()
-
-        # Banco de dados: sempre PostgreSQL.
+        self.store_type = os.getenv("VECTOR_STORE", "postgres")
         self.db = PostgresStore()
-        self.store_type = "postgres"
+        self.ollama = OllamaClient()
+        
+        # Estado para monitoramento (Dashboard)
+        self.state = {
+            "stats": {"new": 0, "cached": 0, "skipped": 0, "errors": 0},
+            "current_file": "",
+            "current_folder": "",
+            "project_id": ""
+        }
+        
+        # Configuração de chunking
+        settings = self.config.get_all().get("indexing", {})
+        self.chunk_size = settings.get("chunk_size", int(os.getenv("CHUNK_SIZE", "8000")))
+        self.chunk_overlap = settings.get("chunk_overlap", int(os.getenv("CHUNK_OVERLAP", "1000")))
+        
+        logger.info(f"RAGService inicializado | Store: {self.store_type.upper()} | Chunk: {self.chunk_size} chars / Overlap: {self.chunk_overlap} chars")
+        self._persist_state()
 
-        indexing_cfg = settings.get("indexing", {})
-        chunk_size = indexing_cfg.get("chunk_size", 12000)
-        chunk_overlap = indexing_cfg.get("chunk_overlap", 1000)
+    def _persist_state(self):
+        """Salva o estado atual em um arquivo para o dashboard."""
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            # Não usamos o logger aqui para evitar recursão infinita se o erro for no disco
+            sys.stderr.write(f"DEBUG: Erro ao persistir estado: {str(e)}\n")
 
-        # Text splitter base (usado para docs e linguagens sem separador específico)
-        self._base_chunk_size = chunk_size
-        self._base_chunk_overlap = chunk_overlap
+    def update_state(self, **kwargs):
+        """Atualiza o estado e persiste no disco."""
+        if "stats_inc" in kwargs:
+            inc = kwargs.pop("stats_inc")
+            for key, val in inc.items():
+                self.state["stats"][key] = self.state["stats"].get(key, 0) + val
+        
+        self.state.update(kwargs)
+        self._persist_state()
 
-        logger.info(
-            f"RAGService inicializado | Store: {self.store_type.upper()} | "
-            f"Chunk: {chunk_size} chars / Overlap: {chunk_overlap} chars"
-        )
+    def _get_splitter(self, file_path: str):
+        """Retorna o splitter adequado baseado na extensão do arquivo."""
+        ext = os.path.splitext(file_path)[1].lower() if file_path else ""
+        
+        separators = None
+        if ext in {".rs"}:
+            separators = ["\nfn ", "\nimpl ", "\nstruct ", "\nenum ", "\ntrait ", "\nmod ", "\n\n", "\n", " "]
+        elif ext in {".c", ".cpp", ".h", ".hpp"}:
+            separators = ["\nclass ", "\nstruct ", "\nvoid ", "\nint ", "\nnamespace ", "\n\n", "\n", " "]
+        elif ext in {".lua"}:
+            separators = ["\nfunction ", "\nlocal function ", "\n\n", "\n", " "]
+        elif ext in {".py"}:
+            separators = ["\ndef ", "\nclass ", "\n\n", "\n", " "]
+        elif ext in {".json"}:
+            separators = ["\n  },", "\n  {", "\n],", "\n[", "\n\n", "\n", " "]
 
-    def _get_splitter(self, file_path: str = None) -> RecursiveCharacterTextSplitter:
-        """Retorna um splitter otimizado para a linguagem do arquivo."""
-        separators = _get_separators_for_file(file_path) if file_path else _DEFAULT_SEPARATORS
         return RecursiveCharacterTextSplitter(
-            chunk_size=self._base_chunk_size,
-            chunk_overlap=self._base_chunk_overlap,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
             separators=separators,
+            keep_separator=True
         )
+        
+    def _get_category(self, file_path: str) -> str:
+        """Determina a categoria baseada no caminho (Elite Mapping + Dynamic Fallback)."""
+        if not file_path:
+            return "others"
+            
+        path_lower = file_path.lower().replace("\\", "/")
+        
+        # 1. Elite Mapping (Sinais Fortes de Arquitetura)
+        elite_map = {
+            # FoxOT / OpenTibia
+            "/npc/": "npc",
+            "/monster/": "monster",
+            "/spells/": "spell",
+            "/actions/": "action",
+            "/movements/": "movement",
+            "/lib/": "lib",
+            "/scripts/": "script",
+            
+            # FoxClient
+            "/modules/": "client_module",
+            "/data/": "client_data",
+            
+            # Rust Star (Engine)
+            "/client/": "engine_client",
+            "/server/": "engine_server",
+            "/shared/": "engine_shared",
+            "/proto/": "protocol",
+            
+            # Global / Infra
+            "/engine/": "engine",
+            "/src/": "engine",
+            "/docs/": "docs",
+            "/config/": "config",
+            "/assets/": "assets",
+            "/tools/": "tools"
+        }
+        
+        for pattern, cat in elite_map.items():
+            if pattern in path_lower:
+                return cat
+                
+        # 2. Dynamic Fallback (Pasta pai imediata)
+        parts = [p for p in path_lower.split("/") if p]
+        if len(parts) > 1:
+            # Pega o nome da pasta pai do arquivo
+            return parts[-2]
+            
+        return "others"
 
-    def index_text(
-        self,
-        text: str,
-        project_id: str,
-        source: str = "manual",
-        file_hash: str = None,
-        session_active: bool = False,
-        file_path: str = None,
-    ) -> str:
-        """Divide o texto em chunks, gera embeddings e salva no banco.
+    def _get_tags(self, file_path: str) -> list:
+        """Extrai tags semânticas da hierarquia de pastas."""
+        if not file_path:
+            return []
+            
+        path_norm = file_path.replace("\\", "/")
+        parts = [p for p in path_norm.split("/") if p]
+        
+        # Filtra partes irrelevantes (como letras de drive no Windows ou caminhos de sistema)
+        # Mantém apenas as últimas 4 partes (contexto local)
+        ignored = {"c:", "phantasy", "users", "appdata", "local", "temp"}
+        tags = [p for p in parts if p.lower() not in ignored and len(p) > 1]
+        
+        return tags[-5:] # Retorna no máximo as últimas 5 partes do caminho como tags
 
-        Args:
-            session_active: Se True, mantém modelos na VRAM (modo batch).
-            file_path: Caminho do arquivo original para seleção de separadores.
+    def _calculate_md5(self, text: str) -> str:
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+    def index_text(self, text: str, source: str, project_id: str, file_path: str = None, session_active: bool = False) -> str:
+        """Divide o texto em chunks e indexa no banco de dados.
+        Se o embedding de um chunk falhar, tenta subdividi-lo em pedaços menores.
         """
         try:
-            if not text.strip():
-                logger.warning(f"Texto vazio ignorado para {source}")
-                return "Aviso: Conteúdo vazio não indexado."
+            file_hash = self._calculate_md5(text)
 
             # Verificação de cache por hash MD5
             if file_hash and hasattr(self.db, "check_hash"):
                 if self.db.check_hash(file_hash, project_id):
-                    logger.info(f"Cache Hit: {source} inalterado. Pulando.")
-                    return "Cache Hit: Arquivo já indexado."
+                    self.update_state(stats_inc={"cached": 1})
+                    return "Cache Hit"
 
             logger.info(f"Indexando: {source} (Projeto: {project_id})")
+            self.update_state(
+                current_file=os.path.basename(source),
+                current_folder=os.path.dirname(source),
+                project_id=project_id
+            )
 
             splitter = self._get_splitter(file_path or source)
             chunks = splitter.split_text(text)
@@ -133,150 +176,119 @@ class RAGService:
 
             for i, chunk in enumerate(chunks):
                 is_last = i == total - 1
-                # Em modo sessão batch, só descarrega na chamada final
                 should_unload = (not session_active) and is_last
 
-                embedding = self.ollama.get_embedding(chunk, auto_unload=should_unload)
-                doc_id = str(uuid.uuid4())
                 metadata = {
                     "source": source,
                     "project_id": project_id,
                     "chunk_index": i,
                     "total_chunks": total,
+                    "category": self._get_category(source),
+                    "tags": self._get_tags(source)
                 }
-                self.db.add_document(doc_id, embedding, chunk, metadata, file_hash=file_hash)
 
-            return f"{total} fragmentos indexados com sucesso de '{source}'."
+                # Heartbeat para arquivos grandes
+                if total > 10 and (i % 5 == 0 or is_last):
+                    logger.info(f"  > Progresso {source}: Fragmento {i+1}/{total}...")
+
+                try:
+                    # Tentativa normal de gerar embedding
+                    embedding = self.ollama.get_embedding(chunk, auto_unload=should_unload)
+                except Exception as e:
+                    logger.warning(f"  ! Falha no fragmento {i+1}/{total} de {source}. Tentando subdividir... Erro: {str(e)}")
+                    try:
+                        # Subdivide o fragmento problemático em 4 pedaços menores
+                        sub_size = len(chunk) // 4
+                        sub_chunks = [chunk[j:j+sub_size] for j in range(0, len(chunk), sub_size)]
+                        
+                        for sc_idx, sub_chunk in enumerate(sub_chunks):
+                            if not sub_chunk.strip(): continue
+                            # Embedding para o sub-pedaço
+                            sub_emb = self.ollama.get_embedding(sub_chunk, auto_unload=should_unload and sc_idx == len(sub_chunks)-1)
+                            sub_id = f"{str(uuid.uuid4())}_sub_{sc_idx}"
+                            
+                            logger.debug(f"  [DB] Gravando sub-fragmento {sc_idx}...")
+                            self.db.add_document(sub_id, sub_emb, sub_chunk, {**metadata, "sub_chunk": sc_idx}, file_hash=file_hash)
+                            logger.debug(f"  [DB] Sub-fragmento {sc_idx} OK.")
+                        
+                        logger.info(f"  ✓ Fragmento {i+1} recuperado via subdivisão.")
+                        continue # Pula para o próximo fragmento principal
+                    except Exception as sub_e:
+                        logger.error(f"  ✗ Falha crítica no fragmento {i+1} mesmo após subdivisão: {str(sub_e)}")
+                        self.update_state(stats_inc={"errors": 1})
+                        continue
+
+                # Inserção normal se o embedding funcionou
+                doc_id = str(uuid.uuid4())
+                logger.debug(f"  [DB] Gravando fragmento {i+1}/{total}...")
+                self.db.add_document(doc_id, embedding, chunk, metadata, file_hash=file_hash)
+                logger.debug(f"  [DB] Fragmento {i+1}/{total} OK.")
+
+            self.update_state(
+                stats_inc={"new": 1},
+                current_file="" # Limpa ao terminar o arquivo
+            )
+            return f"{total} fragmentos indexados com sucesso."
 
         except Exception as e:
             logger.error(f"Erro ao indexar texto de {source}: {str(e)}")
+            _embed_state["stats"]["errors"] += 1
             raise
 
     def index_file_by_path(self, file_path: str, project_id: str, session_active: bool = False) -> str:
         """Lê o arquivo, calcula MD5 e indexa se o conteúdo mudou desde a última indexação."""
         try:
-            import hashlib
-            ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+            if not os.path.exists(file_path):
+                return f"Erro: Arquivo {file_path} não encontrado."
 
-            with open(file_path, "rb") as f:
-                content_bytes = f.read()
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
 
-            file_hash = hashlib.md5(content_bytes).hexdigest()
+            if not text.strip():
+                return "Arquivo vazio."
 
-            if ext == "pdf":
-                text = self._extract_text_from_pdf(file_path)
-            else:
-                text = content_bytes.decode("utf-8", errors="replace")
-
-            return self.index_text(
-                text,
-                project_id,
-                source=file_path,
-                file_hash=file_hash,
-                session_active=session_active,
-                file_path=file_path,
-            )
+            return self.index_text(text, file_path, project_id, file_path=file_path, session_active=session_active)
         except Exception as e:
-            logger.error(f"Erro ao ler arquivo {file_path}: {str(e)}")
-            raise
-
-    def _extract_text_from_pdf(self, file_path: str) -> str:
-        """Extrai texto de um PDF usando pypdf."""
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(file_path)
-            pages = [p.extract_text() for p in reader.pages if p.extract_text()]
-            return "\n".join(pages)
-        except Exception as e:
-            logger.error(f"Falha na extração do PDF {file_path}: {str(e)}")
-            return ""
-
-    def index_image(self, file_path: str, project_id: str) -> str:
-        """Usa Vision para descrever a imagem e indexa o texto com metadados de origem."""
-        try:
-            abs_path = os.path.abspath(file_path)
-            file_name = os.path.basename(file_path)
-
-            description = self.ollama.describe_image(abs_path)
-            if not description:
-                return "Erro: Não foi possível gerar descrição para a imagem."
-
-            # Injeta metadados de origem no texto para melhorar busca semântica futura
-            enhanced_text = (
-                f"ORIGEM VISUAL: {file_name}\n"
-                f"LOCALIZAÇÃO: {abs_path}\n"
-                f"PROJETO: {project_id}\n\n"
-                f"DESCRIÇÃO TÉCNICA:\n{description}"
-            )
-
-            return self.index_text(enhanced_text, project_id, source=abs_path)
-        except Exception as e:
-            logger.error(f"Erro ao indexar imagem {file_path}: {str(e)}")
-            raise
+            logger.error(f"Erro ao ler/indexar arquivo {file_path}: {str(e)}")
+            _embed_state["stats"]["errors"] += 1
+            return f"Erro: {str(e)}"
 
     def search_and_generate(self, question: str, project_id: str = None) -> dict:
-        """Busca contexto relevante e gera resposta usando RAG filtrado por projeto."""
+        """Realiza busca vetorial e gera resposta RAG."""
         try:
-            target_label = project_id if project_id else "GLOBAL (Todos os Projetos)"
-            logger.info(f"Iniciando busca RAG: '{question[:60]}...' | Escopo: {target_label}")
+            # 1. Gera embedding da pergunta
+            question_embedding = self.ollama.get_embedding(question, auto_unload=False)
 
-            query_embedding = self.ollama.get_embedding(question)
+            # 2. Busca no banco
+            results = self.db.search(question_embedding, project_id=project_id, n_results=5)
 
-            settings = self.config.get_all()
-            n_results = settings.get("rag", {}).get("n_results", 5)
-            search_results = self.db.query(query_embedding, project_id=project_id, n_results=n_results)
+            if not results:
+                return {"answer": "Nenhum contexto encontrado.", "sources": []}
 
-            contexts = []
-            if search_results and "documents" in search_results and search_results["documents"]:
-                contexts = search_results["documents"][0]
+            # 3. Monta contexto para o modelo
+            context_texts = []
+            sources = []
+            for doc in results:
+                context_texts.append(doc["content"])
+                sources.append(doc["metadata"])
 
-            # Inclui metadados de fonte para citação
-            sources_meta = []
-            if search_results and "metadatas" in search_results and search_results["metadatas"]:
-                sources_meta = search_results["metadatas"][0] or []
+            context_str = "\n\n".join(context_texts)
 
-            # Monta contexto com atribuição de fonte
-            context_parts = []
-            for i, (ctx, meta) in enumerate(zip(contexts, sources_meta)):
-                src = meta.get("source", "desconhecido") if meta else "desconhecido"
-                proj = meta.get("project_id", "") if meta else ""
-                header = f"[Fonte {i+1}: {os.path.basename(src)} | Projeto: {proj}]"
-                context_parts.append(f"{header}\n{ctx}")
-
-            context_str = "\n\n".join(context_parts)
-
-            if not contexts:
-                logger.warning(f"Nenhum contexto encontrado para: {target_label}")
-            else:
-                logger.info(f"{len(contexts)} fragmentos recuperados.")
-
+            # 4. Gera resposta
             answer = self.ollama.generate_response(question, context_str, project_id=project_id)
 
-            return {
-                "answer": answer,
-                "context_used": contexts,
-                "sources": sources_meta,
-                "project_id": project_id,
-            }
+            return {"answer": answer, "sources": sources}
         except Exception as e:
-            logger.error(f"Falha crítica no pipeline RAG: {str(e)}")
-            raise
+            logger.error(f"Erro no fluxo RAG: {str(e)}")
+            return {"answer": f"Erro: {str(e)}", "sources": []}
 
-    def list_indexed_sources(self, project_id: str = None) -> list:
-        """Lista todos os arquivos únicos indexados no banco."""
-        try:
-            if hasattr(self.db, "list_sources"):
-                return self.db.list_sources(project_id)
-            return []
-        except Exception as e:
-            logger.error(f"Erro ao listar fontes: {str(e)}")
-            return []
+    def list_indexed_sources(self, project_id: str = None) -> List[Dict[str, Any]]:
+        """Lista todas as fontes únicas indexadas."""
+        return self.db.list_sources(project_id)
 
     def clear_database(self, project_id: str = None) -> str:
-        """Limpa a base de dados, opcionalmente filtrada por projeto."""
+        """Limpa a base de dados (projeto específico ou global)."""
         if project_id:
-            logger.info(f"Limpando base de dados do projeto: {project_id}")
             return self.db.delete_by_project(project_id)
         else:
-            logger.warning("Limpando TODA a base de dados vetorial.")
             return self.db.clear()

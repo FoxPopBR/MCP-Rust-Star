@@ -17,15 +17,26 @@ class PostgresStore:
         self._init_db()
 
     def _init_db(self):
-        """Inicializa o pool de conexões e as extensões básicas."""
+        """Inicializa o pool de conexões com timeouts e extensões básicas."""
         try:
+            # connect_timeout: 10s para estabelecer conexão
+            # options: configurações de keepalive para detectar queda de link
+            conn_params = {
+                "host": self.host,
+                "port": self.port,
+                "database": self.db_name,
+                "user": self.user,
+                "password": self.password,
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5
+            }
+            
             self._pool = psycopg2.pool.SimpleConnectionPool(
-                1, 10,  # Min 1, Max 10 conexões
-                host=self.host,
-                port=self.port,
-                database=self.db_name,
-                user=self.user,
-                password=self.password
+                1, 15,  # Aumentado para 15 conexões
+                **conn_params
             )
             
             # Garante que a extensão vector existe
@@ -83,6 +94,8 @@ class PostgresStore:
                         content TEXT NOT NULL,
                         embedding vector(2560),
                         metadata JSONB,
+                        category TEXT,
+                        tags JSONB,
                         file_hash TEXT,
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                     );
@@ -98,12 +111,15 @@ class PostgresStore:
             table_name = self._get_table_name(project_id)
             self._ensure_table(table_name)
             
+            category = metadata.get("category", "others")
+            tags = metadata.get("tags", [])
+            
             conn = self._get_conn()
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"INSERT INTO {table_name} (id, content, embedding, metadata, file_hash) VALUES (%s, %s, %s, %s, %s)",
-                        (id, safe_document, embedding, json.dumps(metadata), file_hash)
+                        f"INSERT INTO {table_name} (id, content, embedding, metadata, category, tags, file_hash) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (id, safe_document, embedding, json.dumps(metadata), category, json.dumps(tags), file_hash)
                     )
             finally:
                 self._release_conn(conn)
@@ -132,7 +148,7 @@ class PostgresStore:
             logger.error(f"Erro ao verificar hash: {str(e)}")
             return False
 
-    def query(self, embedding: list, project_id: str = None, n_results: int = 3):
+    def search(self, embedding: list, project_id: str = None, n_results: int = 3):
         """Busca documentos similares usando pgvector."""
         try:
             import numpy as np
@@ -140,7 +156,7 @@ class PostgresStore:
             
             tables = [self._get_table_name(project_id)] if project_id else self._get_all_tables()
             if not tables:
-                return {"documents": [[]], "metadatas": [[]]}
+                return []
             
             if project_id:
                 self._ensure_table(tables[0])
@@ -164,10 +180,14 @@ class PostgresStore:
                             except: return {}
                         return v if isinstance(v, dict) else {}
                         
-                    return {
-                        "documents": [[row[0] for row in rows]],
-                        "metadatas": [[_to_dict(row[1]) for row in rows]],
-                    }
+                    results = []
+                    for row in rows:
+                        results.append({
+                            "content": row[0],
+                            "metadata": _to_dict(row[1]),
+                            "distance": float(row[2])
+                        })
+                    return results
             finally:
                 self._release_conn(conn)
         except Exception as e:

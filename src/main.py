@@ -97,16 +97,25 @@ def get_project_for_path(file_path: str) -> str | None:
 def mcp_tool_with_logging(func):
     """
     Registra a função como ferramenta MCP e:
-    - Captura exceções, loga com traceback e retorna mensagem de erro amigável
+    - Loga o início e fim da execução (Heartbeat).
+    - Captura exceções, loga com traceback e retorna mensagem de erro amigável.
     """
     @mcp.tool()
     @wraps(func)
     async def wrapper(*args, **kwargs):
+        tool_name = func.__name__
+        logger.info(f"[TOOL START] Executando '{tool_name}'...")
+        start_time = datetime.datetime.now()
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
+            duration = (datetime.datetime.now() - start_time).total_seconds()
+            logger.info(f"[TOOL END] '{tool_name}' concluída em {duration:.2f}s")
+            return result
         except Exception as e:
-            logger.error_with_traceback(e, func.__name__)
-            return f"Erro na ferramenta '{func.__name__}': {str(e)}"
+            duration = (datetime.datetime.now() - start_time).total_seconds()
+            logger.error(f"[TOOL ERROR] Falha em '{tool_name}' após {duration:.2f}s")
+            logger.error_with_traceback(e, tool_name)
+            return f"Erro na ferramenta '{tool_name}': {str(e)}"
     return wrapper
 
 
@@ -214,7 +223,7 @@ def _walk_and_index_sync(
 
             if rag.config.is_ignored(file_path, project_root):
                 skipped += 1
-                _embed_state["stats"]["skipped"] += 1
+                rag.update_state(stats_inc={"skipped": 1})
                 continue
 
             if extension and not file.lower().endswith(extension.lower()):
@@ -238,7 +247,7 @@ def _walk_and_index_sync(
                         _embed_state["stats_by_ext"][file_ext] = _embed_state["stats_by_ext"].get(file_ext, 0) + 1
                     else:
                         skipped += 1
-                        _embed_state["stats"]["skipped"] += 1
+                        rag.update_state(stats_inc={"skipped": 1})
                     continue
 
                 result = rag.index_file_by_path(file_path, project_id, session_active=True)
@@ -373,8 +382,17 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
             _embed_log(f"Processando: {project_id} | {project_root}")
 
             try:
-                stats = await asyncio.to_thread(_walk_and_index_sync, project_id, project_root, project_root)
+                # HEARTBEAT: Antes da indexação
+                _embed_log(f"DEBUG: Iniciando _walk_and_index_sync para {project_id}")
+                stats = await asyncio.wait_for(
+                    asyncio.to_thread(_walk_and_index_sync, project_id, project_root, project_root),
+                    timeout=3600  # Timeout de 1 hora por projeto
+                )
+                
+                # HEARTBEAT: Após indexação, antes de descarregar VRAM
+                _embed_log(f"DEBUG: Indexação concluída. Solicitando descarga de VRAM para {project_id}")
                 await asyncio.to_thread(rag.ollama.unload_models)
+                _embed_log(f"DEBUG: VRAM descarregada com sucesso.")
 
                 if project_id not in _embed_state["completed"]:
                     _embed_state["completed"].append(project_id)
@@ -498,7 +516,11 @@ async def index_directory(path: str, extension: str = None) -> str:
     projects = load_projects()
     project_root = projects.get(project_id)
 
-    stats = await asyncio.to_thread(_walk_and_index_sync, project_id, abs_path, project_root, extension)
+    _embed_state["running"] = True
+    try:
+        stats = await asyncio.to_thread(_walk_and_index_sync, project_id, abs_path, project_root, extension)
+    finally:
+        _embed_state["running"] = False
 
     if stats["new"] > 0 or stats["vision"] > 0:
         await asyncio.to_thread(rag.ollama.unload_models)
@@ -734,114 +756,71 @@ async def scan_extensions(project_ids: list = None) -> str:
 
 @mcp_tool_with_logging
 async def get_embed_status() -> str:
-    """Retorna o status atual do embed em background e as últimas linhas de log.
-
-    Use regularmente para monitorar batch_index_projects() em andamento.
-    Mostra: projeto atual, arquivo atual, estatísticas acumuladas,
-    lista de erros e log recente.
-    """
-    state = _embed_state
-
-    if not state["started_at"] and not state["running"]:
+    """Retorna o status atual do embed em background e as últimas linhas de log (Não-Bloqueante)."""
+    # Cria uma cópia local rápida do estado para evitar contenção de thread
+    state = _embed_state.copy()
+    
+    # Se o worker não está rodando na memória, tenta carregar do disco
+    if not state.get("running") and not state.get("started_at"):
         progress = load_batch_progress()
         if progress:
             completed = progress.get("completed", [])
             results = progress.get("results", {})
-            pending = [
-                k for k, v in results.items()
-                if v.get("status") != "ok"
-            ]
             return (
-                f"Nenhum embed ativo no momento.\n"
-                f"Progresso salvo de sessão anterior:\n"
+                f"Nenhum embed ativo na memória.\n"
+                f"Progresso persistido no disco:\n"
                 f"  Concluídos: {completed}\n"
-                + (f"  Com erro: {pending}\n" if pending else "")
-                + f"Execute batch_index_projects() para iniciar ou retomar."
+                f"Use batch_index_projects() para retomar."
             )
-        return "Nenhum embed ativo. Use scan_extensions() para pré-visualizar e batch_index_projects() para iniciar."
+        return "Nenhum embed ativo."
 
     lines = []
-
-    # ── Status geral ──────────────────────────────────────────────────────────
-    if state["running"]:
-        lines.append("⟳ STATUS: EM ANDAMENTO")
-    elif state["canceled"]:
-        lines.append("✗ STATUS: CANCELADO")
-    else:
-        lines.append("✓ STATUS: CONCLUÍDO")
-
-    if state["started_at"]:
-        started = state["started_at"]
-        if state["running"]:
-            # Calcula tempo decorrido
-            try:
-                started_dt = datetime.datetime.fromisoformat(started)
-                elapsed = datetime.datetime.now() - started_dt
-                h, rem = divmod(int(elapsed.total_seconds()), 3600)
-                m, s = divmod(rem, 60)
-                elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
-                lines.append(f"Iniciado: {started} | Decorrido: {elapsed_str}")
-            except Exception:
-                lines.append(f"Iniciado: {started}")
-        else:
-            lines.append(f"Iniciado: {started}")
-
-    if state["finished_at"] and not state["running"]:
-        lines.append(f"Finalizado: {state['finished_at']}")
-
-    # ── Projeto e arquivo atuais ──────────────────────────────────────────────
-    if state["running"]:
-        if state["current_project"]:
-            lines.append(f"\nProjeto atual: {state['current_project']}")
-        if state["current_file"]:
-            lines.append(f"Arquivo atual: ...{state['current_file'][-80:]}")
-
-    # ── Estatísticas ──────────────────────────────────────────────────────────
-    s = state["stats"]
-    total_processed = s["new"] + s["cached"]
-    total_expected = state.get("total_expected", 0)
-    pct = round((total_processed / total_expected * 100) if total_expected > 0 else 0, 1)
-
-    lines.append(
-        f"\nEstatísticas acumuladas:\n"
-        f"  ✓ Novos indexados:  {s['new']}\n"
-        f"  ⊙ Cache (já tinha): {s['cached']}\n"
-        f"  ○ Ignorados:        {s['skipped']}\n"
-        f"  ✗ Erros:            {s['errors']}\n"
-        f"  Progresso:          {total_processed} / {total_expected} ({pct}%)"
-    )
     
-    if state.get("stats_by_ext"):
-        lines.append(f"\nExtensões Indexadas:")
-        for ext, cnt in sorted(state["stats_by_ext"].items(), key=lambda x: -x[1]):
-            ext_label = ext if ext else "[Sem Extensão]"
-            lines.append(f"  {ext_label:8}: {cnt}")
+    # Status Visual
+    status_icon = "⟳" if state["running"] else "✓"
+    status_text = "EM ANDAMENTO" if state["running"] else "CONCLUÍDO"
+    lines.append(f"{status_icon} STATUS: {status_text}")
 
-    # ── Projetos concluídos e fila ────────────────────────────────────────────
-    if state["completed"]:
-        lines.append(f"\nConcluídos: {state['completed']}")
-    if state["queue"]:
-        queue_names = [q["project_id"] for q in state["queue"]]
-        lines.append(f"Aguardando na fila: {queue_names}")
+    # Tempo Decorrido
+    if state["started_at"]:
+        try:
+            started_dt = datetime.datetime.fromisoformat(state["started_at"])
+            elapsed = datetime.datetime.now() - started_dt
+            lines.append(f"Duração: {str(elapsed).split('.')[0]}")
+        except: pass
 
-    # ── Arquivos com erro ─────────────────────────────────────────────────────
-    if state["error_files"]:
-        ef_list = state["error_files"]
-        lines.append(f"\n✗ Arquivos com erro ({len(ef_list)}):")
-        for ef in ef_list[-10:]:
-            fname = os.path.basename(ef["file"])
-            err = ef["error"][:80]
-            lines.append(f"  [{ef['project_id']}] {fname}: {err}")
-        if len(ef_list) > 10:
-            lines.append(f"  ... e mais {len(ef_list) - 10}")
-        lines.append("  → Use retry_failed_files() para tentar novamente.")
+    # Progresso Atual
+    if state["current_project"]:
+        lines.append(f"Projeto: {state['current_project']}")
+    if state["current_file"]:
+        # Mostra apenas o final do caminho para economizar espaço
+        fname = state["current_file"].split(os.sep)[-1]
+        lines.append(f"Arquivo: {fname}")
 
-    # ── Log recente ───────────────────────────────────────────────────────────
-    if state["log_lines"]:
-        recent = state["log_lines"][-25:]
-        lines.append(f"\nLog recente (últimas {len(recent)} entradas):")
-        for l in recent:
-            lines.append(f"  {l}")
+    # Estatísticas Rápidas
+    s = state["stats"]
+    lines.append(
+        f"\nEstatísticas:\n"
+        f"  ✓ {s['new']} novos | ⊙ {s['cached']} cache | ✗ {s['errors']} erros"
+    )
+
+    # Log Recente (Lido direto do arquivo para evitar lock de memória)
+    try:
+        log_path = "logs/mcp_error.log"
+        if os.path.exists(log_path):
+            with open(log_path, "r", encoding="utf-8") as f:
+                # Lê as últimas 10 linhas de forma eficiente
+                all_lines = f.readlines()
+                log_tail = all_lines[-10:]
+                if log_tail:
+                    lines.append("\nLog recente:")
+                    for line in log_tail:
+                        # Tenta remover o timestamp longo para facilitar leitura
+                        parts = line.split(" - ")
+                        clean_line = parts[-1].strip() if len(parts) > 1 else line.strip()
+                        lines.append(f"  > {clean_line}")
+    except:
+        lines.append("\n(Log inacessível no momento)")
 
     return "\n".join(lines)
 
