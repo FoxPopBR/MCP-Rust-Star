@@ -1,0 +1,17 @@
+{
+  "indexing": {
+    "ignored_extensions": [".log", ".exe", ".dll", ".pyd", ".pyc", ".tmp", ".bak", ".git", ".venv", ".node_modules", ".DS_Store"],
+    "use_gitignore": true,
+    "chunk_size": 12000,
+    "chunk_overlap": 1000
+  },
+  "vision": {
+    "auto_index_images": false,
+    "auto_index_folders": [],
+    "allowed_image_extensions": [".png", ".jpg", ".jpeg"]
+  },
+  "rag": {
+    "n_results": 5,
+    "context_window": 12288
+  }
+}

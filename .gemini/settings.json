@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "rust-star": {
+      "command": "c:/Phantasy/MCP Rust Star/.venv/Scripts/python.exe",
+      "args": [
+        "-m",
+        "src.main"
+      ],
+      "cwd": "c:/Phantasy/MCP Rust Star",
+      "env": {
+        "PYTHONPATH": "c:/Phantasy/MCP Rust Star",
+        "VECTOR_STORE_TYPE": "postgres"
+      }
+    }
+  }
+}
