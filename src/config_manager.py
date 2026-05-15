@@ -79,20 +79,29 @@ class ConfigManager:
     def is_ignored(self, file_path: str, project_root: str = None):
         settings = self.current_settings["indexing"]
         ext = os.path.splitext(file_path)[1].lower()
-        
+        name = os.path.basename(file_path)
+
         # 1. Filtro de Extensão
-        if ext in settings["ignored_extensions"]:
+        if ext in settings.get("ignored_extensions", []):
             return True
-            
-        # 2. Filtro .gitignore
-        if settings["use_gitignore"] and project_root:
+
+        # 2. Filtro de Diretórios ignorados (verifica cada componente do path)
+        ignored_dirs = set(settings.get("ignored_dirs", []))
+        if ignored_dirs:
+            parts = os.path.normpath(file_path).split(os.sep)
+            for part in parts[:-1]:  # Exclui o nome do arquivo em si
+                if part in ignored_dirs:
+                    return True
+
+        # 3. Filtro .gitignore
+        if settings.get("use_gitignore", True) and project_root:
             rel_path = os.path.relpath(file_path, project_root)
             patterns = self.get_gitignore_patterns(project_root)
             for pattern in patterns:
-                # Normaliza pattern para match de diretório
                 clean_pattern = pattern.rstrip('/')
-                if fnmatch.fnmatch(rel_path, pattern) or \
-                   fnmatch.fnmatch(os.path.basename(file_path), pattern) or \
-                   rel_path.startswith(clean_pattern + os.sep):
+                if (fnmatch.fnmatch(rel_path, pattern)
+                        or fnmatch.fnmatch(name, pattern)
+                        or rel_path.startswith(clean_pattern + os.sep)):
                     return True
+
         return False

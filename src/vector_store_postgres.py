@@ -24,11 +24,8 @@ class PostgresStore:
                 password=self.password
             )
             self.conn.autocommit = True
-            
-            # Garante que a extensão existe ANTES de registrar o tipo no driver
             with self.conn.cursor() as cur:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            
             register_vector(self.conn)
         return self.conn
 
@@ -37,7 +34,6 @@ class PostgresStore:
         try:
             conn = self._get_connection()
             with conn.cursor() as cur:
-                # Cria a tabela de conhecimento
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS knowledge_embeddings (
                         id UUID PRIMARY KEY,
@@ -49,9 +45,6 @@ class PostgresStore:
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
-                # NOTA: O pgvector v0.5+ e versões anteriores têm limite de 2000 dimensões para índices HNSW/IVFFlat.
-                # Como o Qwen usa 2560 dimensões, usaremos busca exata (sem índice) por enquanto para garantir precisão total.
-                # Para projetos de médio porte, a diferença de performance é imperceptível.
             logger.info("PostgresStore inicializado com busca exata (Sem índice vetorial para >2000 dimensões).")
         except Exception as e:
             logger.error(f"Erro ao inicializar PostgresStore: {str(e)}")
@@ -64,7 +57,7 @@ class PostgresStore:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO knowledge_embeddings (id, project_id, content, embedding, metadata, file_hash) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (id, metadata.get('project_id'), document, embedding, json.dumps(metadata), file_hash)
+                    (id, metadata.get("project_id"), document, embedding, json.dumps(metadata), file_hash)
                 )
             logger.debug(f"Documento {id} adicionado ao Postgres (Hash: {file_hash}).")
         except Exception as e:
@@ -89,39 +82,70 @@ class PostgresStore:
         """Busca documentos similares usando busca vetorial do pgvector."""
         try:
             import numpy as np
-            # Converte para array numpy para garantir compatibilidade com pgvector
             emb_array = np.array(embedding)
-            
             conn = self._get_connection()
             with conn.cursor() as cur:
                 if project_id:
                     cur.execute(
-                        "SELECT content, metadata FROM knowledge_embeddings WHERE project_id = %s ORDER BY embedding <=> %s LIMIT %s",
+                        "SELECT content, metadata FROM knowledge_embeddings "
+                        "WHERE project_id = %s ORDER BY embedding <=> %s LIMIT %s",
                         (project_id, emb_array, n_results)
                     )
                 else:
                     cur.execute(
-                        "SELECT content, metadata FROM knowledge_embeddings ORDER BY embedding <=> %s LIMIT %s",
+                        "SELECT content, metadata FROM knowledge_embeddings "
+                        "ORDER BY embedding <=> %s LIMIT %s",
                         (emb_array, n_results)
                     )
-                
                 rows = cur.fetchall()
-                # Formata no estilo do ChromaDB para compatibilidade
-                results = {
-                    'documents': [[row[0] for row in rows]],
-                    'metadatas': [[row[1] for row in rows]]
+                # psycopg2 pode retornar JSONB como string ou dict dependendo do driver.
+                # Normalizamos explicitamente para garantir dict sempre.
+                def _to_dict(v):
+                    if isinstance(v, str):
+                        try:
+                            return json.loads(v)
+                        except Exception:
+                            return {}
+                    return v if isinstance(v, dict) else {}
+                return {
+                    "documents": [[row[0] for row in rows]],
+                    "metadatas": [[_to_dict(row[1]) for row in rows]],
                 }
-                return results
         except Exception as e:
             logger.error(f"Erro ao consultar PostgresStore: {str(e)}")
             raise
+
+    def list_sources(self, project_id: str = None) -> list:
+        """Lista todos os arquivos únicos indexados, opcionalmente filtrado por projeto."""
+        try:
+            conn = self._get_connection()
+            with conn.cursor() as cur:
+                if project_id:
+                    cur.execute(
+                        "SELECT DISTINCT project_id, metadata->>'source' AS source "
+                        "FROM knowledge_embeddings WHERE project_id = %s ORDER BY source",
+                        (project_id,)
+                    )
+                else:
+                    cur.execute(
+                        "SELECT DISTINCT project_id, metadata->>'source' AS source "
+                        "FROM knowledge_embeddings ORDER BY project_id, source"
+                    )
+                rows = cur.fetchall()
+                return [{"project_id": r[0], "source": r[1] or "desconhecido"} for r in rows]
+        except Exception as e:
+            logger.error(f"Erro ao listar fontes no Postgres: {str(e)}")
+            return []
 
     def delete_by_project(self, project_id: str):
         """Remove todos os dados de um projeto."""
         try:
             conn = self._get_connection()
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM knowledge_embeddings WHERE project_id = %s", (project_id,))
+                cur.execute(
+                    "DELETE FROM knowledge_embeddings WHERE project_id = %s",
+                    (project_id,)
+                )
             logger.info(f"Dados do projeto '{project_id}' removidos do Postgres.")
             return f"Dados do projeto '{project_id}' removidos."
         except Exception as e:

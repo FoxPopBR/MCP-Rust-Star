@@ -1,6 +1,24 @@
 {
   "indexing": {
-    "ignored_extensions": [".log", ".exe", ".dll", ".pyd", ".pyc", ".tmp", ".bak", ".git", ".venv", ".node_modules", ".DS_Store"],
+    "ignored_extensions": [
+      ".log", ".exe", ".dll", ".pyd", ".pyc", ".tmp", ".bak",
+      ".obj", ".o", ".a", ".lib", ".pdb", ".ilk", ".exp",
+      ".bin", ".dat", ".otbm", ".spr", ".rsstar",
+      ".zip", ".tar", ".gz", ".7z", ".rar", ".lzma", ".xz", ".zst",
+      ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp",
+      ".eot", ".ttf", ".woff", ".woff2", ".svg",
+      ".map", ".lock", ".phar",
+      ".0-linux-amd64", ".6-amd64", ".arm", ".x86"
+    ],
+    "ignored_dirs": [
+      ".git", ".venv", "venv", "node_modules", "target",
+      "__pycache__", ".pytest_cache", "dist", "build",
+      ".idea", ".vscode",
+      "assets", "vcpkg", "vcpkg_installed", "vcpkg_packages",
+      "cmake-build-debug", "cmake-build-release", "cmake-build-relwithdebinfo",
+      "third_party", "external", "vendor", "libs",
+      "screenshots", "logs"
+    ],
     "use_gitignore": true,
     "chunk_size": 12000,
     "chunk_overlap": 1000
@@ -13,5 +31,6 @@
   "rag": {
     "n_results": 5,
     "context_window": 12288
-  }
+  },
+  "vector_store": "chroma"
 }
