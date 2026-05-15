@@ -1,7 +1,7 @@
 import uuid
 import os
 from src.ollama_client import OllamaClient
-from src.vector_store import VectorStore
+from src.vector_store_postgres import PostgresStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.config_manager import ConfigManager
 
@@ -72,20 +72,9 @@ class RAGService:
         self.config = ConfigManager()
         settings = self.config.get_all()
 
-        # Escolha do provedor de banco de dados via variável de ambiente
-        store_type = os.getenv("VECTOR_STORE_TYPE", settings.get("vector_store", "chroma")).lower()
-        if store_type == "postgres":
-            try:
-                from src.vector_store_postgres import PostgresStore
-                self.db = PostgresStore()
-                self.store_type = "postgres"
-            except Exception as e:
-                logger.warning(f"Falha ao conectar ao PostgreSQL ({str(e)}). Fallback para ChromaDB.")
-                self.db = VectorStore()
-                self.store_type = "chroma"
-        else:
-            self.db = VectorStore()
-            self.store_type = "chroma"
+        # Banco de dados: sempre PostgreSQL.
+        self.db = PostgresStore()
+        self.store_type = "postgres"
 
         indexing_cfg = settings.get("indexing", {})
         chunk_size = indexing_cfg.get("chunk_size", 12000)

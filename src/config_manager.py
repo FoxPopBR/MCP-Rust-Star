@@ -11,6 +11,7 @@ class ConfigManager:
         self.factory_defaults = self._load_json(FACTORY_DEFAULTS_FILE)
         self.user_prefs = self._load_json(USER_PREFS_FILE)
         self.current_settings = self._merge_configs(self.factory_defaults, self.user_prefs)
+        self._gitignore_cache = {}
 
     def _load_json(self, path):
         if os.path.exists(path):
@@ -63,6 +64,9 @@ class ConfigManager:
 
     def get_gitignore_patterns(self, project_root: str):
         if not project_root: return []
+        if project_root in self._gitignore_cache:
+            return self._gitignore_cache[project_root]
+            
         gitignore_path = os.path.join(project_root, ".gitignore")
         patterns = []
         if os.path.exists(gitignore_path):
@@ -74,22 +78,38 @@ class ConfigManager:
                             patterns.append(line)
             except Exception as e:
                 logger.error(f"Erro ao processar .gitignore em {project_root}: {e}")
-        return patterns
+        
+        # Pré-processa os padrões para otimizar o fnmatch
+        processed_patterns = []
+        for p in patterns:
+            processed_patterns.append((p, p.rstrip('/')))
+            
+        self._gitignore_cache[project_root] = processed_patterns
+        return processed_patterns
 
     def is_ignored(self, file_path: str, project_root: str = None):
         settings = self.current_settings["indexing"]
-        ext = os.path.splitext(file_path)[1].lower()
         name = os.path.basename(file_path)
+        is_dir = os.path.isdir(file_path)
 
-        # 1. Filtro de Extensão
-        if ext in settings.get("ignored_extensions", []):
-            return True
+        # 0. Filtro de Extensão (APENAS PARA ARQUIVOS)
+        if not is_dir:
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            # Whitelist
+            allowed_exts = settings.get("allowed_extensions", [])
+            if allowed_exts and ext not in allowed_exts:
+                return True
 
-        # 2. Filtro de Diretórios ignorados (verifica cada componente do path)
+            # Blacklist (Fallback)
+            if ext in settings.get("ignored_extensions", []):
+                return True
+
+        # 1. Filtro de Diretórios ignorados (verifica TODOS os componentes do path)
         ignored_dirs = set(settings.get("ignored_dirs", []))
         if ignored_dirs:
             parts = os.path.normpath(file_path).split(os.sep)
-            for part in parts[:-1]:  # Exclui o nome do arquivo em si
+            for part in parts:
                 if part in ignored_dirs:
                     return True
 
@@ -97,8 +117,7 @@ class ConfigManager:
         if settings.get("use_gitignore", True) and project_root:
             rel_path = os.path.relpath(file_path, project_root)
             patterns = self.get_gitignore_patterns(project_root)
-            for pattern in patterns:
-                clean_pattern = pattern.rstrip('/')
+            for pattern, clean_pattern in patterns:
                 if (fnmatch.fnmatch(rel_path, pattern)
                         or fnmatch.fnmatch(name, pattern)
                         or rel_path.startswith(clean_pattern + os.sep)):

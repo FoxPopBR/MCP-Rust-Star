@@ -7,6 +7,33 @@ import sys
 import inspect
 import asyncio
 
+
+class WinCompatRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler compatível com Windows.
+
+    No Windows, o rename do arquivo falha com PermissionError (WinError 32)
+    quando outro processo ainda mantém o arquivo aberto. Este handler captura
+    esse erro e continua logando no arquivo atual sem travar o servidor.
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except PermissionError:
+            # Arquivo bloqueado por outra instância no Windows — ignora rotação
+            pass
+        except OSError:
+            pass
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except PermissionError:
+            pass
+        except Exception:
+            self.handleError(record)
+
+
 class CustomLogger:
     def __init__(self, name='RustStarMCP', log_file='logs/mcp_error.log', level=logging.DEBUG, console_log=True, file_log=True, logger_filename='logger.py', include_logger_in_traceback=False):
         self.log_file = os.path.abspath(log_file)
@@ -23,7 +50,10 @@ class CustomLogger:
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
         if file_log:
             os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-            file_handler = RotatingFileHandler(self.log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+            file_handler = WinCompatRotatingFileHandler(
+                self.log_file, maxBytes=10*1024*1024, backupCount=5,
+                encoding='utf-8', delay=True
+            )
             file_handler.setFormatter(formatter)
             file_handler.setLevel(self.level)
             self.logger.addHandler(file_handler)
@@ -96,5 +126,6 @@ class CustomLogger:
         formatted_tb = traceback.format_list(filtered_tb)
         formatted_error = "Traceback (most recent call last):\n" + "".join(formatted_tb) + f"{exc_type.__name__}: {exc_value}"
         self.logger.error(f"Exception in function '{function_name}':\n{formatted_error}", exc_info=False, stacklevel=self.get_stacklevel())
+
 
 logger = CustomLogger(name='RustStarMCP')

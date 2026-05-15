@@ -5,7 +5,9 @@ Servidor de base de conhecimento RAG local para os projetos Rust Star, FoxOT e F
 Ferramentas disponíveis:
   Gestão de Projetos : register_project, list_projects
   Indexação          : index_file, index_directory, index_image,
-                       batch_index_projects
+                       batch_index_projects, scan_extensions,
+                       get_embed_status, cancel_embed,
+                       retry_failed_files
   Busca RAG          : ask_knowledge_base
   Análise Visual     : analyze_screenshot
   Fontes Indexadas   : list_indexed_sources
@@ -16,9 +18,11 @@ Ferramentas disponíveis:
 """
 
 import asyncio
+import datetime
 import os
 import sys
 import json
+from collections import Counter
 from functools import wraps
 from contextlib import redirect_stdout
 
@@ -26,7 +30,7 @@ from mcp.server.fastmcp import FastMCP
 from src.services.rag_service import RAGService
 from tools.logger import logger
 
-# ─── Inicialização do servidor ────────────────────────────────────────────────
+# ─── Inicialização do servidor ─────────────────────────────────────────────────
 
 mcp = FastMCP("Rust Star Knowledge Server")
 rag = RAGService()
@@ -38,7 +42,7 @@ PROJECTS_FILE = "data/projects.json"
 BATCH_PROGRESS_FILE = "data/batch_progress.json"
 
 
-# ─── Helpers de projetos ──────────────────────────────────────────────────────
+# ─── Helpers de projetos ───────────────────────────────────────────────────────
 
 def load_projects() -> dict:
     if os.path.exists(PROJECTS_FILE):
@@ -81,33 +85,339 @@ def get_project_for_path(file_path: str) -> str | None:
     """Identifica o project_id pelo caminho do arquivo (longest-match primeiro)."""
     projects = load_projects()
     file_norm = os.path.normpath(os.path.abspath(file_path)).lower()
-    # Ordena por comprimento de caminho decrescente (mais específico vence)
     for project_id, project_root in sorted(projects.items(), key=lambda x: len(x[1]), reverse=True):
         root_norm = os.path.normpath(os.path.abspath(project_root)).lower()
-        # Usa startswith com separador para evitar false-positive (ex: /foo vs /foobar)
         if file_norm == root_norm or file_norm.startswith(root_norm + os.sep):
             return project_id
     return None
 
 
-# ─── Decorator de logging para ferramentas MCP ───────────────────────────────
+# ─── Decorator de logging para ferramentas MCP ────────────────────────────────
 
 def mcp_tool_with_logging(func):
     """
     Registra a função como ferramenta MCP e:
-    - Redireciona stdout → stderr durante execução (protege o protocolo JSON-RPC)
     - Captura exceções, loga com traceback e retorna mensagem de erro amigável
     """
     @mcp.tool()
     @wraps(func)
     async def wrapper(*args, **kwargs):
-        with redirect_stdout(sys.stderr):
-            try:
-                return await func(*args, **kwargs)
-            except Exception as e:
-                logger.error_with_traceback(e, func.__name__)
-                return f"Erro na ferramenta '{func.__name__}': {str(e)}"
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.error_with_traceback(e, func.__name__)
+            return f"Erro na ferramenta '{func.__name__}': {str(e)}"
     return wrapper
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ESTADO GLOBAL DO EMBED EM BACKGROUND
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_embed_task: asyncio.Task | None = None
+
+_embed_state: dict = {
+    "running": False,
+    "canceled": False,
+    "current_project": None,
+    "current_file": None,
+    "total_expected": 0,
+    "stats": {"new": 0, "cached": 0, "skipped": 0, "errors": 0},
+    "stats_by_ext": {},       # {"ext": count} for embedded files
+    "error_files": [],        # [{"file": path, "error": str, "project_id": str}]
+    "queue": [],              # [{"project_id": str, "project_root": str, "force": bool}]
+    "completed": [],          # project_ids concluídos nesta sessão
+    "log_lines": [],          # buffer circular de log (últimas MAX_LOG_LINES entradas)
+    "started_at": None,
+    "finished_at": None,
+    "total_projects": 0,
+}
+
+MAX_LOG_LINES = 300
+
+
+def _embed_log(msg: str) -> None:
+    """Adiciona linha ao buffer circular de log do embed e ao logger principal."""
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    _embed_state["log_lines"].append(line)
+    if len(_embed_state["log_lines"]) > MAX_LOG_LINES:
+        _embed_state["log_lines"] = _embed_state["log_lines"][-MAX_LOG_LINES:]
+    logger.info(f"[EMBED] {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE DE INDEXAÇÃO (com atualização de estado + retry)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _walk_and_index_sync(
+    project_id: str,
+    abs_path: str,
+    project_root: str,
+    extension: str = None,
+    max_retries: int = 2,
+) -> dict:
+    """Walk-and-index rodando 100% em Thread separada."""
+    settings = rag.config.get_all()
+    vision_cfg = settings["vision"]
+    image_exts = set(vision_cfg.get("allowed_image_extensions", []))
+
+    count = skipped = cached = vision_count = errors = 0
+    retry_queue = []  # arquivos que falharam na primeira tentativa
+
+    _embed_state["current_project"] = project_id
+    _embed_log(f"Início: {project_id} | {abs_path}")
+
+    # ── PRE-SCAN RÁPIDO PARA ESTATÍSTICAS ─────────────────────────────────────
+    total_eligible = 0
+    _embed_log("Executando pré-scan de arquivos elegíveis...")
+    for root, dirs, files in os.walk(abs_path):
+        if not _embed_state["running"]: break
+        dirs[:] = [d for d in dirs if not rag.config.is_ignored(os.path.join(root, d), project_root)]
+        for file in files:
+            file_path = os.path.join(root, file)
+            if not rag.config.is_ignored(file_path, project_root):
+                if extension and not file.lower().endswith(extension.lower()): continue
+                file_ext = os.path.splitext(file)[1].lower()
+                if file_ext in image_exts:
+                    file_abs = os.path.abspath(file_path)
+                    is_auto_folder = any(
+                        file_abs.startswith(os.path.abspath(f) + os.sep)
+                        for f in vision_cfg.get("auto_index_folders", [])
+                    )
+                    if not (vision_cfg.get("auto_index_images", False) or is_auto_folder):
+                        continue
+                total_eligible += 1
+
+    _embed_state["total_expected"] = total_eligible
+    _embed_log(f"Pré-scan concluído: {total_eligible} arquivos elegíveis.")
+
+    # ── INDEXAÇÃO REAL ────────────────────────────────────────────────────────
+    for root, dirs, files in os.walk(abs_path):
+        # Verifica cancelamento antes de cada diretório
+        if not _embed_state["running"]:
+            _embed_log(f"Cancelado em: {project_id}")
+            break
+
+        # Poda diretórios ignorados in-place
+        dirs[:] = [
+            d for d in dirs
+            if not rag.config.is_ignored(os.path.join(root, d), project_root)
+        ]
+
+        for file in files:
+            if not _embed_state["running"]:
+                break
+
+            file_path = os.path.join(root, file)
+            _embed_state["current_file"] = os.path.relpath(file_path, project_root)
+
+            if rag.config.is_ignored(file_path, project_root):
+                skipped += 1
+                _embed_state["stats"]["skipped"] += 1
+                continue
+
+            if extension and not file.lower().endswith(extension.lower()):
+                continue
+
+            try:
+                file_ext = os.path.splitext(file)[1].lower()
+
+                # Imagens: só se Vision estiver ativo
+                if file_ext in image_exts:
+                    file_abs = os.path.abspath(file_path)
+                    is_auto_folder = any(
+                        file_abs.startswith(os.path.abspath(f) + os.sep)
+                        for f in vision_cfg.get("auto_index_folders", [])
+                    )
+                    if vision_cfg.get("auto_index_images", False) or is_auto_folder:
+                        rag.index_image(file_path, project_id)
+                        vision_count += 1
+                        count += 1
+                        _embed_state["stats"]["new"] += 1
+                        _embed_state["stats_by_ext"][file_ext] = _embed_state["stats_by_ext"].get(file_ext, 0) + 1
+                    else:
+                        skipped += 1
+                        _embed_state["stats"]["skipped"] += 1
+                    continue
+
+                result = rag.index_file_by_path(file_path, project_id, session_active=True)
+                if "Cache Hit" in result:
+                    cached += 1
+                    _embed_state["stats"]["cached"] += 1
+                else:
+                    count += 1
+                    _embed_state["stats"]["new"] += 1
+                    _embed_state["stats_by_ext"][file_ext] = _embed_state["stats_by_ext"].get(file_ext, 0) + 1
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning(f"Falha ao indexar {file_path}: {error_msg[:120]}")
+                retry_queue.append({
+                    "file": file_path,
+                    "error": error_msg,
+                    "project_id": project_id,
+                })
+                errors += 1
+                _embed_state["stats"]["errors"] += 1
+
+    # ── RETRY AUTOMÁTICO ──────────────────────────────────────────────────────
+    if retry_queue and max_retries > 0:
+        _embed_log(f"Retry: {len(retry_queue)} arquivo(s) com falha em '{project_id}'")
+        retry_success = 0
+        still_failed = []
+
+        for item in retry_queue:
+            try:
+                result = rag.index_file_by_path(item["file"], project_id, session_active=True)
+                if result:
+                    file_ext = os.path.splitext(item["file"])[1].lower()
+                    retry_success += 1
+                    errors -= 1
+                    _embed_state["stats"]["errors"] -= 1
+                    count += 1
+                    _embed_state["stats"]["new"] += 1
+                    _embed_state["stats_by_ext"][file_ext] = _embed_state["stats_by_ext"].get(file_ext, 0) + 1
+            except Exception as e:
+                still_failed.append({**item, "error": str(e)})
+
+        if retry_success:
+            _embed_log(f"Retry recuperou {retry_success}/{len(retry_queue)} arquivo(s)")
+
+        if still_failed:
+            _embed_state["error_files"].extend(still_failed)
+            _embed_log(f"Ainda com falha após retry: {len(still_failed)} arquivo(s)")
+    else:
+        _embed_state["error_files"].extend(retry_queue)
+
+    return {
+        "new": count,
+        "cached": cached,
+        "skipped": skipped,
+        "vision": vision_count,
+        "errors": errors,
+    }
+
+
+# ─── Worker de background ──────────────────────────────────────────────────────
+
+async def _batch_embed_worker(project_ids_initial: list, force: bool = False) -> None:
+    """Worker assíncrono que roda como background task.
+
+    Processa a fila dinâmica (_embed_state["queue"]) até ela esvaziar ou
+    o embed ser cancelado.
+    """
+    global _embed_state
+
+    # Inicializa estado
+    _embed_state["running"] = True
+    _embed_state["canceled"] = False
+    _embed_state["started_at"] = datetime.datetime.now().isoformat()
+    _embed_state["finished_at"] = None
+    _embed_state["stats"] = {"new": 0, "cached": 0, "skipped": 0, "errors": 0}
+    _embed_state["error_files"] = []
+    _embed_state["log_lines"] = []
+    _embed_state["completed"] = []
+    _embed_state["current_file"] = None
+    _embed_state["current_project"] = None
+
+    projects = load_projects()
+
+    # Carrega progresso de sessão anterior para retomada automática
+    progress = {} if force else load_batch_progress()
+    completed_prev = set(progress.get("completed", []))
+    results = progress.get("results", {})
+
+    # Popula fila com os projetos iniciais
+    if project_ids_initial is None:
+        project_ids_initial = list(projects.keys())
+
+    for pid in project_ids_initial:
+        if pid in projects:
+            _embed_state["queue"].append({
+                "project_id": pid,
+                "project_root": projects[pid],
+                "force": force,
+            })
+
+    _embed_state["total_projects"] = len(_embed_state["queue"])
+    _embed_log(
+        f"Worker iniciado | {_embed_state['total_projects']} projeto(s) na fila"
+        + (f" | Retomando: {sorted(completed_prev)}" if completed_prev else "")
+    )
+
+    try:
+        while _embed_state["queue"] and _embed_state["running"]:
+            item = _embed_state["queue"].pop(0)
+            project_id = item["project_id"]
+            project_root = item["project_root"]
+            item_force = item.get("force", force)
+
+            # Pula projetos já concluídos (a menos que force)
+            if project_id in completed_prev and not item_force:
+                prev = results.get(project_id, {})
+                _embed_log(
+                    f"SKIP {project_id}: já indexado "
+                    f"({prev.get('new', '?')} novos, {prev.get('cached', '?')} cache)"
+                )
+                if project_id not in _embed_state["completed"]:
+                    _embed_state["completed"].append(project_id)
+                continue
+
+            if not os.path.isdir(project_root):
+                _embed_log(f"ERRO {project_id}: caminho inválido '{project_root}'")
+                results[project_id] = {"status": "erro", "message": "caminho inválido"}
+                save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                continue
+
+            _embed_log(f"Processando: {project_id} | {project_root}")
+
+            try:
+                stats = await asyncio.to_thread(_walk_and_index_sync, project_id, project_root, project_root)
+                await asyncio.to_thread(rag.ollama.unload_models)
+
+                if project_id not in _embed_state["completed"]:
+                    _embed_state["completed"].append(project_id)
+                completed_prev.add(project_id)
+                results[project_id] = {"status": "ok", **stats}
+                save_batch_progress({"completed": sorted(completed_prev), "results": results})
+
+                _embed_log(
+                    f"OK {project_id}: {stats['new']} novos | "
+                    f"{stats['cached']} cache | "
+                    f"{stats['skipped']} ignorados | "
+                    f"{stats['errors']} erros"
+                )
+
+            except Exception as e:
+                _embed_log(f"FALHA {project_id}: {str(e)[:120]}")
+                results[project_id] = {"status": "erro", "message": str(e)}
+                save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                # Continua para o próximo projeto
+
+    finally:
+        await asyncio.to_thread(rag.ollama.unload_models)
+        _embed_state["running"] = False
+        _embed_state["current_project"] = None
+        _embed_state["current_file"] = None
+        _embed_state["finished_at"] = datetime.datetime.now().isoformat()
+
+        # Limpa progresso apenas se concluiu tudo sem cancelamento
+        pending_queue = list(_embed_state["queue"])
+        if not pending_queue and not _embed_state["canceled"]:
+            try:
+                if os.path.exists(BATCH_PROGRESS_FILE):
+                    os.remove(BATCH_PROGRESS_FILE)
+            except Exception:
+                pass
+
+        total_done = len(_embed_state["completed"])
+        _embed_log(
+            f"Worker finalizado | "
+            f"Concluídos: {total_done} | "
+            f"Novos: {_embed_state['stats']['new']} | "
+            f"Erros: {_embed_state['stats']['errors']}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -155,78 +465,8 @@ async def index_file(path: str) -> str:
             f"Erro: '{path}' não pertence a nenhum projeto registrado. "
             f"Use register_project primeiro."
         )
-    result = rag.index_file_by_path(path, project_id)
+    result = await asyncio.to_thread(rag.index_file_by_path, path, project_id)
     return f"{result} | Projeto: {project_id}"
-
-
-async def _walk_and_index(
-    project_id: str,
-    abs_path: str,
-    project_root: str,
-    extension: str = None,
-) -> dict:
-    """Core de indexação de diretório. Retorna dict de estatísticas.
-    Reutilizado por index_directory e batch_index_projects.
-    """
-    settings = rag.config.get_all()
-    vision_cfg = settings["vision"]
-    image_exts = set(vision_cfg.get("allowed_image_extensions", []))
-
-    count = skipped = cached = vision_count = errors = 0
-
-    logger.info(f"Indexando: {abs_path} | Projeto: {project_id}")
-
-    for root, dirs, files in os.walk(abs_path):
-        # Poda diretórios ignorados in-place para evitar descida desnecessária
-        dirs[:] = [
-            d for d in dirs
-            if not rag.config.is_ignored(os.path.join(root, d), project_root)
-        ]
-
-        for file in files:
-            file_path = os.path.join(root, file)
-
-            if rag.config.is_ignored(file_path, project_root):
-                skipped += 1
-                continue
-
-            if extension and not file.lower().endswith(extension.lower()):
-                continue
-
-            try:
-                file_ext = os.path.splitext(file)[1].lower()
-
-                if file_ext in image_exts:
-                    file_abs = os.path.abspath(file_path)
-                    is_auto_folder = any(
-                        file_abs.startswith(os.path.abspath(f) + os.sep)
-                        for f in vision_cfg.get("auto_index_folders", [])
-                    )
-                    if vision_cfg.get("auto_index_images", False) or is_auto_folder:
-                        rag.index_image(file_path, project_id)
-                        vision_count += 1
-                        count += 1
-                    else:
-                        skipped += 1
-                    continue
-
-                result = rag.index_file_by_path(file_path, project_id, session_active=True)
-                if "Cache Hit" in result:
-                    cached += 1
-                else:
-                    count += 1
-
-            except Exception as e:
-                logger.warning(f"Falha ao indexar {file_path}: {str(e)}")
-                errors += 1
-
-    return {
-        "new": count,
-        "cached": cached,
-        "skipped": skipped,
-        "vision": vision_count,
-        "errors": errors,
-    }
 
 
 @mcp_tool_with_logging
@@ -237,7 +477,7 @@ async def index_directory(path: str, extension: str = None) -> str:
         path: Diretório a indexar (deve pertencer a um projeto registrado).
         extension: Opcional. Filtra por extensão (ex: '.rs', '.cpp').
     """
-    status = rag.ollama.check_connection()
+    status = await asyncio.to_thread(rag.ollama.check_connection)
     if not status["connected"]:
         return (
             f"Erro: Ollama não está disponível em {rag.ollama.base_url}. "
@@ -258,10 +498,10 @@ async def index_directory(path: str, extension: str = None) -> str:
     projects = load_projects()
     project_root = projects.get(project_id)
 
-    stats = await _walk_and_index(project_id, abs_path, project_root, extension)
+    stats = await asyncio.to_thread(_walk_and_index_sync, project_id, abs_path, project_root, extension)
 
     if stats["new"] > 0 or stats["vision"] > 0:
-        rag.ollama.unload_models()
+        await asyncio.to_thread(rag.ollama.unload_models)
 
     return (
         f"Indexação concluída | Projeto: '{project_id}'\n"
@@ -273,35 +513,44 @@ async def index_directory(path: str, extension: str = None) -> str:
 
 
 @mcp_tool_with_logging
-async def batch_index_projects(project_ids: list = None, force: bool = False) -> str:
+async def batch_index_projects(
+    project_ids: list = None,
+    force: bool = False,
+    background: bool = True,
+) -> str:
     """Indexa múltiplos projetos sequencialmente com progresso persistido.
 
-    Salva progresso em data/batch_progress.json após cada projeto concluído.
-    Se interrompido (crash, Ctrl+C, reinício), retoma automaticamente do ponto
-    onde parou — projetos já concluídos são pulados.
-    O cache MD5 garante que arquivos já indexados nunca sejam reprocessados,
-    mesmo dentro de um projeto parcialmente indexado.
+    Por padrão roda em BACKGROUND: o servidor MCP continua respondendo enquanto
+    o embed acontece. Use get_embed_status() para monitorar o progresso em
+    tempo real.
+
+    Se chamado enquanto embed já está em andamento, os novos projetos são
+    ADICIONADOS À FILA e serão processados na sequência.
+
+    O cache MD5 garante que arquivos já indexados não sejam reprocessados.
+    Em caso de crash, execute novamente para retomar de onde parou.
 
     Args:
-        project_ids: Lista de IDs de projeto a indexar em ordem.
-                     Se None, usa todos os projetos registrados.
+        project_ids: Lista de IDs a indexar. None = todos os projetos registrados.
                      Ex: ["MCP Rust Star", "Rust Star", "FoxOT", "FoxClient"]
-        force: Se True, reprocessa projetos já marcados como concluídos
-               no progresso salvo (útil para re-indexar após mudanças).
+        force: Se True, reprocessa projetos já concluídos anteriormente.
+        background: True (padrão) = roda em background, retorna imediatamente.
+                    False = bloqueia até concluir (útil para scripts/testes).
     """
+    global _embed_task
+
     # ── PRE-FLIGHT ────────────────────────────────────────────────────────────
     status = rag.ollama.check_connection()
     if not status["connected"]:
         return (
-            f"Erro: Ollama não está disponível. "
-            f"Inicie o Ollama antes de indexar. Detalhe: {status.get('error', '')}"
+            f"Erro: Ollama não disponível. Inicie antes de indexar.\n"
+            f"Detalhe: {status.get('error', '')}"
         )
 
     projects = load_projects()
     if not projects:
         return "Nenhum projeto registrado. Use register_project primeiro."
 
-    # Resolve lista de projetos
     if project_ids is None:
         target_ids = list(projects.keys())
     else:
@@ -313,94 +562,368 @@ async def batch_index_projects(project_ids: list = None, force: bool = False) ->
             )
         target_ids = project_ids
 
-    # ── PROGRESSO ANTERIOR ────────────────────────────────────────────────────
-    progress = {} if force else load_batch_progress()
-    completed = set(progress.get("completed", []))
-    results = progress.get("results", {})
+    # ── SE JÁ ESTÁ RODANDO: adiciona à fila ──────────────────────────────────
+    if _embed_state["running"]:
+        added = []
+        for pid in target_ids:
+            if pid in projects:
+                _embed_state["queue"].append({
+                    "project_id": pid,
+                    "project_root": projects[pid],
+                    "force": force,
+                })
+                added.append(pid)
+        queue_names = [q["project_id"] for q in _embed_state["queue"]]
+        return (
+            f"⟳ Embed já em andamento: {_embed_state['current_project']}\n"
+            f"Projetos adicionados à fila: {added}\n"
+            f"Fila completa: {queue_names}\n"
+            f"Use get_embed_status() para monitorar."
+        )
+
+    # ── MODO SÍNCRONO (bloqueia) ──────────────────────────────────────────────
+    if not background:
+        _embed_state["queue"] = []
+        await _batch_embed_worker(target_ids, force)
+        s = _embed_state["stats"]
+        return (
+            f"Embed síncrono concluído!\n"
+            f"  ✓ Novos:     {s['new']}\n"
+            f"  ⊙ Cache:     {s['cached']}\n"
+            f"  ○ Ignorados: {s['skipped']}\n"
+            f"  ✗ Erros:     {s['errors']}\n"
+            f"  Projetos: {_embed_state['completed']}"
+        )
+
+    # ── MODO BACKGROUND (padrão) ──────────────────────────────────────────────
+    _embed_state["queue"] = []  # Limpa fila antiga antes de iniciar
+
+    _embed_task = asyncio.create_task(_batch_embed_worker(target_ids, force))
+
+    # Pequeno yield para o worker inicializar
+    await asyncio.sleep(0.05)
+
+    progress = load_batch_progress()
+    completed_prev = progress.get("completed", [])
+    skip_count = len([p for p in target_ids if p in completed_prev and not force])
+
+    return (
+        f"✓ Embed iniciado em background!\n"
+        f"  Projetos na fila: {target_ids}\n"
+        f"  Force reindex: {force}\n"
+        + (f"  (Pulando {skip_count} já indexados — use force=True para reprocessar)\n"
+           if skip_count else "")
+        + f"\nUse get_embed_status() para acompanhar o progresso em tempo real.\n"
+        f"Use cancel_embed() para cancelar se necessário."
+    )
+
+
+@mcp_tool_with_logging
+async def scan_extensions(project_ids: list = None) -> str:
+    """Escaneia projetos e lista todas as extensões encontradas — SEM indexar nada.
+
+    Use ANTES de batch_index_projects para confirmar quais tipos de arquivo
+    serão processados. Mostra o que será indexado vs. o que já está na lista
+    de ignorados. Arquivos sem extensão são listados separadamente.
+
+    Args:
+        project_ids: Lista de projetos a escanear. None = todos registrados.
+    """
+    projects = load_projects()
+    if not projects:
+        return "Nenhum projeto registrado."
+
+    if project_ids is None:
+        target_ids = list(projects.keys())
+    else:
+        unknown = [p for p in project_ids if p not in projects]
+        if unknown:
+            return f"Projetos não registrados: {unknown}\nDisponíveis: {list(projects.keys())}"
+        target_ids = project_ids
+
+    settings = rag.config.get_all()
+    already_ignored = set(settings.get("indexing", {}).get("ignored_extensions", []))
+
+    ext_by_project: dict[str, Counter] = {}
+    no_ext_files: list[str] = []
+    total_files = 0
+
+    for pid in target_ids:
+        project_root = projects[pid]
+        if not os.path.isdir(project_root):
+            continue
+
+        ext_by_project[pid] = Counter()
+
+        for root, dirs, files in os.walk(project_root):
+            dirs[:] = [
+                d for d in dirs
+                if not rag.config.is_ignored(os.path.join(root, d), project_root)
+            ]
+            for fname in files:
+                file_path = os.path.join(root, fname)
+                if rag.config.is_ignored(file_path, project_root):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext:
+                    ext_by_project[pid][ext] += 1
+                else:
+                    no_ext_files.append(
+                        f"[{pid}] {os.path.relpath(file_path, project_root)}"
+                    )
+                total_files += 1
+
+        # Cede controle ao event loop
+        await asyncio.sleep(0)
+
+    # Agrega todos os projetos
+    all_exts: Counter = Counter()
+    for c in ext_by_project.values():
+        all_exts.update(c)
+
+    will_index = {ext: cnt for ext, cnt in all_exts.items() if ext not in already_ignored}
+    will_skip = {ext: cnt for ext, cnt in all_exts.items() if ext in already_ignored}
 
     lines = [
-        f"╔══ BATCH INDEX: {len(target_ids)} projeto(s) ══╗",
-        f"  Projetos: {target_ids}",
-        f"  Já concluídos (da sessão anterior): {sorted(completed & set(target_ids))}",
+        f"═══ SCAN DE EXTENSÕES ═══",
+        f"Projetos: {target_ids}",
+        f"Total de arquivos elegíveis: {total_files}",
         "",
     ]
-    logger.info(f"[BATCH] Iniciando: {target_ids} | Concluídos: {sorted(completed)}")
 
-    # ── LOOP PRINCIPAL ────────────────────────────────────────────────────────
-    for project_id in target_ids:
-        # Pula projetos já concluídos (retomada automática)
-        if project_id in completed and not force:
-            prev = results.get(project_id, {})
-            lines.append(
-                f"✓ {project_id}: concluído anteriormente "
-                f"({prev.get('new', '?')} novos, {prev.get('cached', '?')} cache) "
-                f"— pulando"
-            )
-            continue
+    if will_index:
+        total_to_index = sum(will_index.values())
+        lines.append(
+            f"✓ SERÃO INDEXADOS ({len(will_index)} tipos, {total_to_index} arquivo(s)):"
+        )
+        for ext, cnt in sorted(will_index.items(), key=lambda x: -x[1]):
+            lines.append(f"   {ext:15}  {cnt:6} arquivo(s)")
+    else:
+        lines.append("(Nenhum arquivo para indexar com os filtros atuais)")
 
-        project_root = projects.get(project_id)
-        if not project_root or not os.path.isdir(project_root):
-            msg = f"Caminho inválido ou inacessível: '{project_root}'"
-            lines.append(f"✗ {project_id}: {msg}")
-            results[project_id] = {"status": "erro", "message": msg}
-            save_batch_progress({"completed": sorted(completed), "results": results})
-            logger.warning(f"[BATCH] Pulando {project_id}: {msg}")
-            continue
+    if no_ext_files:
+        lines.append(
+            f"\n⚠ ARQUIVOS SEM EXTENSÃO ({len(no_ext_files)}) — "
+            f"serão indexados se forem texto legível:"
+        )
+        for f in no_ext_files[:20]:
+            lines.append(f"   {f}")
+        if len(no_ext_files) > 20:
+            lines.append(f"   ... e mais {len(no_ext_files) - 20}")
 
-        lines.append(f"⟳ {project_id}: iniciando ({project_root})...")
-        logger.info(f"[BATCH] Projeto: {project_id} | Root: {project_root}")
+    if will_skip:
+        total_skip = sum(will_skip.values())
+        lines.append(
+            f"\n○ JÁ NA LISTA DE IGNORADOS ({len(will_skip)} tipos, {total_skip} arquivo(s)):"
+        )
+        for ext, cnt in sorted(will_skip.items(), key=lambda x: -x[1]):
+            lines.append(f"   {ext:15}  {cnt:6} arquivo(s)")
 
-        try:
-            stats = await _walk_and_index(project_id, project_root, project_root)
-
-            # Descarrega VRAM entre projetos para não acumular
-            rag.ollama.unload_models()
-
-            summary = (
-                f"✓ {project_id}: "
-                f"{stats['new']} novos | "
-                f"{stats['cached']} cache | "
-                f"{stats['skipped']} ignorados"
-                + (f" | {stats['errors']} ERROS" if stats["errors"] else "")
-            )
-            lines[-1] = summary  # Substitui o "⟳ iniciando..."
-
-            completed.add(project_id)
-            results[project_id] = {"status": "ok", **stats}
-            save_batch_progress({"completed": sorted(completed), "results": results})
-            logger.info(f"[BATCH] Concluído: {project_id} | Stats: {stats}")
-
-        except Exception as e:
-            msg = str(e)
-            lines[-1] = f"✗ {project_id}: FALHA — {msg}"
-            results[project_id] = {"status": "erro", "message": msg}
-            save_batch_progress({"completed": sorted(completed), "results": results})
-            logger.error(f"[BATCH] Falha em {project_id}: {msg}")
-            # Continua para o próximo projeto
-
-    # ── RELATÓRIO FINAL ───────────────────────────────────────────────────────
-    rag.ollama.unload_models()
-
-    pending = [p for p in target_ids if p not in completed]
     lines += [
         "",
-        f"╠══ RESUMO ══╣",
-        f"  Concluídos: {len(completed & set(target_ids))}/{len(target_ids)}",
+        "─" * 60,
+        "Para ignorar extensões indesejadas ANTES de indexar:",
+        '  update_indexing_settings(ignored_extensions=[".ext1", ".ext2", ...])',
+        "",
+        "Quando a lista estiver correta:",
+        "  batch_index_projects()  ← inicia embed em background",
     ]
 
-    if pending:
-        lines.append(
-            f"  Pendentes:  {pending}\n"
-            f"  → Execute batch_index_projects() novamente para retomar."
-        )
+    return "\n".join(lines)
+
+
+@mcp_tool_with_logging
+async def get_embed_status() -> str:
+    """Retorna o status atual do embed em background e as últimas linhas de log.
+
+    Use regularmente para monitorar batch_index_projects() em andamento.
+    Mostra: projeto atual, arquivo atual, estatísticas acumuladas,
+    lista de erros e log recente.
+    """
+    state = _embed_state
+
+    if not state["started_at"] and not state["running"]:
+        progress = load_batch_progress()
+        if progress:
+            completed = progress.get("completed", [])
+            results = progress.get("results", {})
+            pending = [
+                k for k, v in results.items()
+                if v.get("status") != "ok"
+            ]
+            return (
+                f"Nenhum embed ativo no momento.\n"
+                f"Progresso salvo de sessão anterior:\n"
+                f"  Concluídos: {completed}\n"
+                + (f"  Com erro: {pending}\n" if pending else "")
+                + f"Execute batch_index_projects() para iniciar ou retomar."
+            )
+        return "Nenhum embed ativo. Use scan_extensions() para pré-visualizar e batch_index_projects() para iniciar."
+
+    lines = []
+
+    # ── Status geral ──────────────────────────────────────────────────────────
+    if state["running"]:
+        lines.append("⟳ STATUS: EM ANDAMENTO")
+    elif state["canceled"]:
+        lines.append("✗ STATUS: CANCELADO")
     else:
-        lines.append("  Todos os projetos indexados com sucesso! ✓")
-        # Limpa arquivo de progresso ao concluir tudo
+        lines.append("✓ STATUS: CONCLUÍDO")
+
+    if state["started_at"]:
+        started = state["started_at"]
+        if state["running"]:
+            # Calcula tempo decorrido
+            try:
+                started_dt = datetime.datetime.fromisoformat(started)
+                elapsed = datetime.datetime.now() - started_dt
+                h, rem = divmod(int(elapsed.total_seconds()), 3600)
+                m, s = divmod(rem, 60)
+                elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
+                lines.append(f"Iniciado: {started} | Decorrido: {elapsed_str}")
+            except Exception:
+                lines.append(f"Iniciado: {started}")
+        else:
+            lines.append(f"Iniciado: {started}")
+
+    if state["finished_at"] and not state["running"]:
+        lines.append(f"Finalizado: {state['finished_at']}")
+
+    # ── Projeto e arquivo atuais ──────────────────────────────────────────────
+    if state["running"]:
+        if state["current_project"]:
+            lines.append(f"\nProjeto atual: {state['current_project']}")
+        if state["current_file"]:
+            lines.append(f"Arquivo atual: ...{state['current_file'][-80:]}")
+
+    # ── Estatísticas ──────────────────────────────────────────────────────────
+    s = state["stats"]
+    total_processed = s["new"] + s["cached"]
+    total_expected = state.get("total_expected", 0)
+    pct = round((total_processed / total_expected * 100) if total_expected > 0 else 0, 1)
+
+    lines.append(
+        f"\nEstatísticas acumuladas:\n"
+        f"  ✓ Novos indexados:  {s['new']}\n"
+        f"  ⊙ Cache (já tinha): {s['cached']}\n"
+        f"  ○ Ignorados:        {s['skipped']}\n"
+        f"  ✗ Erros:            {s['errors']}\n"
+        f"  Progresso:          {total_processed} / {total_expected} ({pct}%)"
+    )
+    
+    if state.get("stats_by_ext"):
+        lines.append(f"\nExtensões Indexadas:")
+        for ext, cnt in sorted(state["stats_by_ext"].items(), key=lambda x: -x[1]):
+            ext_label = ext if ext else "[Sem Extensão]"
+            lines.append(f"  {ext_label:8}: {cnt}")
+
+    # ── Projetos concluídos e fila ────────────────────────────────────────────
+    if state["completed"]:
+        lines.append(f"\nConcluídos: {state['completed']}")
+    if state["queue"]:
+        queue_names = [q["project_id"] for q in state["queue"]]
+        lines.append(f"Aguardando na fila: {queue_names}")
+
+    # ── Arquivos com erro ─────────────────────────────────────────────────────
+    if state["error_files"]:
+        ef_list = state["error_files"]
+        lines.append(f"\n✗ Arquivos com erro ({len(ef_list)}):")
+        for ef in ef_list[-10:]:
+            fname = os.path.basename(ef["file"])
+            err = ef["error"][:80]
+            lines.append(f"  [{ef['project_id']}] {fname}: {err}")
+        if len(ef_list) > 10:
+            lines.append(f"  ... e mais {len(ef_list) - 10}")
+        lines.append("  → Use retry_failed_files() para tentar novamente.")
+
+    # ── Log recente ───────────────────────────────────────────────────────────
+    if state["log_lines"]:
+        recent = state["log_lines"][-25:]
+        lines.append(f"\nLog recente (últimas {len(recent)} entradas):")
+        for l in recent:
+            lines.append(f"  {l}")
+
+    return "\n".join(lines)
+
+
+@mcp_tool_with_logging
+async def cancel_embed() -> str:
+    """Cancela o embed em background (para após o arquivo atual terminar).
+
+    O progresso já salvo é mantido — você pode retomar depois com
+    batch_index_projects() (projetos concluídos serão pulados automaticamente).
+    """
+    global _embed_task
+
+    if not _embed_state["running"]:
+        return "Nenhum embed em andamento para cancelar."
+
+    _embed_state["running"] = False
+    _embed_state["canceled"] = True
+    _embed_state["queue"] = []  # Esvazia fila
+
+    # Aguarda o arquivo atual terminar (não interrompe no meio)
+    await asyncio.sleep(1.0)
+
+    s = _embed_state["stats"]
+    return (
+        f"✓ Cancelamento solicitado. O embed parou após o arquivo atual.\n"
+        f"\nResumo até o cancelamento:\n"
+        f"  Projetos concluídos: {_embed_state['completed']}\n"
+        f"  Novos indexados: {s['new']}\n"
+        f"  Erros: {s['errors']}\n"
+        f"\nExecute batch_index_projects() para retomar de onde parou."
+    )
+
+
+@mcp_tool_with_logging
+async def retry_failed_files() -> str:
+    """Re-indexa arquivos que falharam durante o último embed.
+
+    Use get_embed_status() para ver a lista de arquivos com erro antes de usar.
+    Não pode ser executado enquanto embed está em andamento.
+    """
+    error_files = list(_embed_state.get("error_files", []))
+
+    if not error_files:
+        return "Nenhum arquivo com falha registrado. Use get_embed_status() para verificar."
+
+    if _embed_state["running"]:
+        return (
+            "Embed em andamento. Aguarde concluir antes de executar retry.\n"
+            "Ou use cancel_embed() para cancelar primeiro."
+        )
+
+    total = len(error_files)
+    success = 0
+    still_failed = []
+
+    _embed_log(f"Retry manual iniciado: {total} arquivo(s)")
+
+    for item in error_files:
         try:
-            if os.path.exists(BATCH_PROGRESS_FILE):
-                os.remove(BATCH_PROGRESS_FILE)
-        except Exception:
-            pass
+            result = rag.index_file_by_path(item["file"], item["project_id"])
+            if result:
+                success += 1
+                _embed_state["stats"]["errors"] = max(0, _embed_state["stats"]["errors"] - 1)
+                _embed_state["stats"]["new"] += 1
+        except Exception as e:
+            still_failed.append({**item, "error": str(e)})
+
+    _embed_state["error_files"] = still_failed
+    _embed_log(f"Retry manual concluído: {success}/{total} recuperados")
+
+    lines = [
+        f"Retry concluído:\n"
+        f"  ✓ Recuperados: {success}/{total}\n"
+        f"  ✗ Ainda falham: {len(still_failed)}"
+    ]
+    if still_failed:
+        lines.append("\nArquivos ainda com erro:")
+        for ef in still_failed[:15]:
+            lines.append(f"  [{ef['project_id']}] {os.path.basename(ef['file'])}: {ef['error'][:80]}")
+        if len(still_failed) > 15:
+            lines.append(f"  ... e mais {len(still_failed) - 15}")
 
     return "\n".join(lines)
 
@@ -441,7 +964,6 @@ async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: s
     if ext not in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
         return f"Erro: Formato '{ext}' não suportado. Use PNG, JPG ou JPEG."
 
-    # Verificação Ollama
     status = rag.ollama.check_connection()
     if not status["connected"]:
         return f"Erro: Ollama offline. {status.get('error', '')}"
@@ -450,10 +972,7 @@ async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: s
 
     logger.info(f"Analisando screenshot: {path}")
 
-    # Injeta hint de contexto no prompt se fornecido
     if context_hint:
-        original_prompt = rag.ollama.describe_image
-        # Temporariamente substitui o prompt interno com contexto adicional
         import base64
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -479,12 +998,10 @@ async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: s
     if not description:
         return "Erro: Não foi possível gerar análise. Verifique se o modelo suporta Vision."
 
-    # Salva na base de conhecimento se solicitado
     kb_status = ""
     if save_to_kb:
         project_id = get_project_for_path(path)
         if not project_id:
-            # Tenta salvar no projeto "Rust Star" como default
             projects = load_projects()
             project_id = next(iter(projects), None)
 
@@ -519,7 +1036,7 @@ async def ask_knowledge_base(question: str, project_id: str = None) -> str:
         project_id: Opcional. Filtra por projeto (ex: 'Rust Star', 'FoxOT', 'FoxClient').
                     Se omitido, busca em todos os projetos.
     """
-    result = rag.search_and_generate(question, project_id)
+    result = await asyncio.to_thread(rag.search_and_generate, question, project_id)
     target = project_id if project_id else "TODOS OS PROJETOS"
 
     response = f"=== RESPOSTA [{target}] ===\n\n{result['answer']}\n\n"
@@ -552,12 +1069,11 @@ async def list_indexed_sources(project_id: str = None) -> str:
     Args:
         project_id: Opcional. Filtra por projeto específico.
     """
-    sources = rag.list_indexed_sources(project_id)
+    sources = await asyncio.to_thread(rag.list_indexed_sources, project_id)
     if not sources:
         scope = f"projeto '{project_id}'" if project_id else "qualquer projeto"
         return f"Nenhuma fonte indexada encontrada para {scope}."
 
-    # Agrupa por projeto
     by_project: dict[str, list] = {}
     for s in sources:
         pid = s.get("project_id", "desconhecido")
@@ -599,14 +1115,26 @@ async def get_server_settings() -> str:
 @mcp_tool_with_logging
 async def update_indexing_settings(
     ignored_extensions: list = None,
+    ignored_dirs: list = None,
     use_gitignore: bool = None,
     chunk_size: int = None,
     chunk_overlap: int = None,
 ) -> str:
-    """Atualiza configurações de indexação. Persiste em data/user_preferences.json."""
+    """Atualiza configurações de indexação. Persiste em data/user_preferences.json.
+
+    Args:
+        ignored_extensions: Lista de extensões a ignorar (ex: ['.log', '.tmp']).
+                            Sobrescreve a lista atual — inclua tudo que deseja ignorar.
+        ignored_dirs: Lista de nomes de diretórios a ignorar.
+        use_gitignore: True para respeitar .gitignore dos projetos.
+        chunk_size: Tamanho máximo de chunk em caracteres para o splitter.
+        chunk_overlap: Overlap entre chunks em caracteres.
+    """
     updates = {}
     if ignored_extensions is not None:
         updates["ignored_extensions"] = ignored_extensions
+    if ignored_dirs is not None:
+        updates["ignored_dirs"] = ignored_dirs
     if use_gitignore is not None:
         updates["use_gitignore"] = use_gitignore
     if chunk_size is not None:
@@ -650,7 +1178,7 @@ async def reset_server_settings() -> str:
 @mcp_tool_with_logging
 async def check_ollama_status() -> str:
     """Verifica conexão com Ollama e disponibilidade dos modelos configurados."""
-    status = rag.ollama.check_connection()
+    status = await asyncio.to_thread(rag.ollama.check_connection)
     if not status["connected"]:
         return (
             f"✗ Ollama DESCONECTADO ({rag.ollama.base_url})\n"
@@ -670,13 +1198,13 @@ async def check_ollama_status() -> str:
 @mcp_tool_with_logging
 async def get_gpu_status() -> str:
     """Verifica uso atual de VRAM da GPU (apenas NVIDIA via nvidia-smi)."""
-    return rag.ollama.get_gpu_usage()
+    return await asyncio.to_thread(rag.ollama.get_gpu_usage)
 
 
 @mcp_tool_with_logging
 async def unload_vram() -> str:
     """Descarrega os modelos Ollama da VRAM imediatamente (Ejeção de Emergência)."""
-    success = rag.ollama.unload_models()
+    success = await asyncio.to_thread(rag.ollama.unload_models)
     return "✓ Modelos descarregados. VRAM liberada." if success else "✗ Falha ao descarregar modelos."
 
 
@@ -687,11 +1215,11 @@ async def clear_knowledge_base(project_id: str = None) -> str:
     Args:
         project_id: Se informado, limpa apenas este projeto. Caso contrário, limpa tudo.
     """
-    result = rag.clear_database(project_id)
+    result = await asyncio.to_thread(rag.clear_database, project_id)
     return result
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ─── Entry point ───────────────────────────────────────────────────────────────
 
 def handle_exit():
     """Libera recursos ao encerrar o servidor."""
@@ -699,8 +1227,24 @@ def handle_exit():
     rag.ollama.unload_models()
 
 
+async def _windows_stdin_keepalive():
+    """Previne o deadlock do ProactorEventLoop ocioso no Windows com stdin."""
+    while True:
+        await asyncio.sleep(0.5)
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(handle_exit)
+    
+    # Injeta a task de keepalive no event loop antes do MCP rodar
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    loop.create_task(_windows_stdin_keepalive())
+    
     logger.info("=== MCP RUST STAR KNOWLEDGE SERVER INICIADO ===")
     mcp.run()

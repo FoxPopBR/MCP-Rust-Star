@@ -128,10 +128,10 @@ class OllamaClient:
     def unload_models(self) -> bool:
         """Descarrega ambos os modelos da VRAM imediatamente."""
         try:
-            logger.info("Descarregando modelos da VRAM...")
+            logger.info(f"Solicitando descarga de modelos da VRAM (Embedding: {self.embedding_model}, RAG: {self.rag_model})...")
             self._unload_model(self.embedding_model, is_chat=False)
             self._unload_model(self.rag_model, is_chat=True)
-            logger.info("VRAM liberada com sucesso.")
+            logger.info("Comandos de descarga de modelos enviados com sucesso.")
             return True
         except Exception as e:
             logger.error(f"Erro ao descarregar modelos: {str(e)}")
@@ -177,5 +177,6 @@ class OllamaClient:
                 )
             else:
                 self.client.generate(model=model_name, prompt="", keep_alive=0)
+            logger.info(f"Modelo {model_name} descarregado (keep_alive=0 enviado).")
         except Exception as e:
             logger.debug(f"Aviso ao descarregar {model_name}: {str(e)}")
