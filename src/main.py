@@ -24,10 +24,12 @@ import sys
 import json
 from collections import Counter
 from functools import wraps
-from contextlib import redirect_stdout
+import threading
+import contextlib
 
 from mcp.server.fastmcp import FastMCP
 from src.services.rag_service import RAGService
+from src.services.telemetry_writer import TelemetryWriter, InventoryProvider
 from tools.logger import logger
 
 # ─── Inicialização do servidor ─────────────────────────────────────────────────
@@ -40,6 +42,27 @@ os.makedirs("logs", exist_ok=True)
 
 PROJECTS_FILE = "data/projects.json"
 BATCH_PROGRESS_FILE = "data/batch_progress.json"
+
+_inventory = InventoryProvider(rag.db)
+_telemetry = TelemetryWriter(inventory=_inventory)
+_batch_progress_cache: dict = {}
+_server_extra: dict = {"last_query": None}
+
+
+def _publish_telemetry() -> None:
+    """Publica snapshot atômico em data/dashboard_state.json. Throttled internamente."""
+    try:
+        _telemetry.write(
+            embed_state=_embed_state,
+            rag_state=rag.state,
+            batch_progress=_batch_progress_cache,
+            server_extra=_server_extra,
+        )
+    except Exception:
+        pass
+
+
+rag._on_state_change = _publish_telemetry
 
 
 # ─── Helpers de projetos ───────────────────────────────────────────────────────
@@ -73,12 +96,24 @@ def load_batch_progress() -> dict:
 
 
 def save_batch_progress(progress: dict) -> None:
-    """Persiste o progresso atual da sessão batch."""
+    """Persiste o progresso atual da sessão batch e replica no snapshot do dashboard."""
     try:
         with open(BATCH_PROGRESS_FILE, "w", encoding="utf-8") as f:
             json.dump(progress, f, indent=4, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Falha ao salvar progresso batch: {e}")
+
+    # Atualiza cache em memória e dispara publicação de telemetria.
+    try:
+        _batch_progress_cache.clear()
+        _batch_progress_cache.update(progress or {})
+    except Exception:
+        pass
+    try:
+        _inventory.invalidate()
+    except Exception:
+        pass
+    _publish_telemetry()
 
 
 def get_project_for_path(file_path: str) -> str | None:
@@ -98,6 +133,7 @@ def mcp_tool_with_logging(func):
     """
     Registra a função como ferramenta MCP e:
     - Loga o início e fim da execução (Heartbeat).
+    - Marca atividade na telemetria (refcount).
     - Captura exceções, loga com traceback e retorna mensagem de erro amigável.
     """
     @mcp.tool()
@@ -106,16 +142,23 @@ def mcp_tool_with_logging(func):
         tool_name = func.__name__
         logger.info(f"[TOOL START] Executando '{tool_name}'...")
         start_time = datetime.datetime.now()
-        try:
-            result = await func(*args, **kwargs)
-            duration = (datetime.datetime.now() - start_time).total_seconds()
-            logger.info(f"[TOOL END] '{tool_name}' concluída em {duration:.2f}s")
-            return result
-        except Exception as e:
-            duration = (datetime.datetime.now() - start_time).total_seconds()
-            logger.error(f"[TOOL ERROR] Falha em '{tool_name}' após {duration:.2f}s")
-            logger.error_with_traceback(e, tool_name)
-            return f"Erro na ferramenta '{tool_name}': {str(e)}"
+        async with contextlib.AsyncExitStack() as stack:
+            # Note: _telemetry.activity() é síncrono, mas o wrapper é async.
+            # Como o context manager é simples e síncrono (apenas locks e ints),
+            # podemos usá-lo dentro de um bloco 'with' normal antes do await
+            # ou usar to_thread se fosse pesado. Aqui é seguro.
+            with _telemetry.activity():
+                try:
+                    result = await func(*args, **kwargs)
+                    duration = (datetime.datetime.now() - start_time).total_seconds()
+                    logger.info(f"[TOOL END] '{tool_name}' concluída em {duration:.2f}s")
+                    return result
+                except Exception as e:
+                    duration = (datetime.datetime.now() - start_time).total_seconds()
+                    logger.error(f"[TOOL ERROR] Falha em '{tool_name}' após {duration:.2f}s")
+                    logger.error_with_traceback(e, tool_name)
+                    _telemetry.set_activity_error(True)
+                    return f"Erro na ferramenta '{tool_name}': {str(e)}"
     return wrapper
 
 
@@ -153,6 +196,7 @@ def _embed_log(msg: str) -> None:
     if len(_embed_state["log_lines"]) > MAX_LOG_LINES:
         _embed_state["log_lines"] = _embed_state["log_lines"][-MAX_LOG_LINES:]
     logger.info(f"[EMBED] {msg}")
+    _publish_telemetry()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -220,6 +264,7 @@ def _walk_and_index_sync(
 
             file_path = os.path.join(root, file)
             _embed_state["current_file"] = os.path.relpath(file_path, project_root)
+            _publish_telemetry()
 
             if rag.config.is_ignored(file_path, project_root):
                 skipped += 1
@@ -330,112 +375,126 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
     _embed_state["current_file"] = None
     _embed_state["current_project"] = None
 
-    projects = load_projects()
+    with _telemetry.activity():
+        try:
+            projects = load_projects()
 
-    # Carrega progresso de sessão anterior para retomada automática
-    progress = {} if force else load_batch_progress()
-    completed_prev = set(progress.get("completed", []))
-    results = progress.get("results", {})
+            # Carrega progresso de sessão anterior para retomada automática
+            progress = {} if force else load_batch_progress()
+            completed_prev = set(progress.get("completed", []))
+            results = progress.get("results", {})
 
-    # Popula fila com os projetos iniciais
-    if project_ids_initial is None:
-        project_ids_initial = list(projects.keys())
+            # Popula fila com os projetos iniciais
+            if project_ids_initial is None:
+                project_ids_initial = list(projects.keys())
 
-    for pid in project_ids_initial:
-        if pid in projects:
-            _embed_state["queue"].append({
-                "project_id": pid,
-                "project_root": projects[pid],
-                "force": force,
-            })
+            for pid in project_ids_initial:
+                if pid in projects:
+                    _embed_state["queue"].append({
+                        "project_id": pid,
+                        "project_root": projects[pid],
+                        "force": force,
+                    })
 
-    _embed_state["total_projects"] = len(_embed_state["queue"])
-    _embed_log(
-        f"Worker iniciado | {_embed_state['total_projects']} projeto(s) na fila"
-        + (f" | Retomando: {sorted(completed_prev)}" if completed_prev else "")
-    )
+            _embed_state["total_projects"] = len(_embed_state["queue"])
+            _embed_log(
+                f"Worker iniciado | {_embed_state['total_projects']} projeto(s) na fila"
+                + (f" | Retomando: {sorted(completed_prev)}" if completed_prev else "")
+            )
 
-    try:
-        while _embed_state["queue"] and _embed_state["running"]:
-            item = _embed_state["queue"].pop(0)
-            project_id = item["project_id"]
-            project_root = item["project_root"]
-            item_force = item.get("force", force)
+            while _embed_state["queue"] and _embed_state["running"]:
+                item = _embed_state["queue"].pop(0)
+                project_id = item["project_id"]
+                project_root = item["project_root"]
+                item_force = item.get("force", force)
 
-            # Pula projetos já concluídos (a menos que force)
-            if project_id in completed_prev and not item_force:
-                prev = results.get(project_id, {})
-                _embed_log(
-                    f"SKIP {project_id}: já indexado "
-                    f"({prev.get('new', '?')} novos, {prev.get('cached', '?')} cache)"
-                )
-                if project_id not in _embed_state["completed"]:
-                    _embed_state["completed"].append(project_id)
-                continue
+                # Pula projetos já concluídos (a menos que force)
+                if project_id in completed_prev and not item_force:
+                    prev = results.get(project_id, {})
+                    _embed_log(
+                        f"SKIP {project_id}: já indexado "
+                        f"({prev.get('new', '?')} novos, {prev.get('cached', '?')} cache)"
+                    )
+                    if project_id not in _embed_state["completed"]:
+                        _embed_state["completed"].append(project_id)
+                    continue
 
-            if not os.path.isdir(project_root):
-                _embed_log(f"ERRO {project_id}: caminho inválido '{project_root}'")
-                results[project_id] = {"status": "erro", "message": "caminho inválido"}
-                save_batch_progress({"completed": sorted(completed_prev), "results": results})
-                continue
+                if not os.path.isdir(project_root):
+                    _embed_log(f"ERRO {project_id}: caminho inválido '{project_root}'")
+                    results[project_id] = {"status": "erro", "message": "caminho inválido"}
+                    save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                    continue
 
-            _embed_log(f"Processando: {project_id} | {project_root}")
+                _embed_log(f"Processando: {project_id} | {project_root}")
 
+                try:
+                    # HEARTBEAT: Antes da indexação
+                    _embed_log(f"DEBUG: Iniciando _walk_and_index_sync para {project_id}")
+                    stats = await asyncio.wait_for(
+                        asyncio.to_thread(_walk_and_index_sync, project_id, project_root, project_root),
+                        timeout=3600  # Timeout de 1 hora por projeto
+                    )
+                    
+                    # HEARTBEAT: Após indexação, antes de descarregar VRAM
+                    _embed_log(f"DEBUG: Indexação concluída. Solicitando descarga de VRAM para {project_id}")
+                    await asyncio.to_thread(rag.ollama.unload_models)
+                    _embed_log(f"DEBUG: VRAM descarregada com sucesso.")
+
+                    if project_id not in _embed_state["completed"]:
+                        _embed_state["completed"].append(project_id)
+                    completed_prev.add(project_id)
+                    results[project_id] = {"status": "ok", **stats}
+                    save_batch_progress({"completed": sorted(completed_prev), "results": results})
+
+                    _embed_log(
+                        f"OK {project_id}: {stats['new']} novos | "
+                        f"{stats['cached']} cache | "
+                        f"{stats['skipped']} ignorados | "
+                        f"{stats['errors']} erros"
+                    )
+
+                except Exception as e:
+                    _embed_log(f"FALHA {project_id}: {str(e)[:120]}")
+                    results[project_id] = {"status": "erro", "message": str(e)}
+                    save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                    # Continua para o próximo projeto
+
+        finally:
+            await asyncio.to_thread(rag.ollama.unload_models)
+            _embed_state["running"] = False
+            _embed_state["current_project"] = None
+            _embed_state["current_file"] = None
+            _embed_state["finished_at"] = datetime.datetime.now().isoformat()
+
+            # Limpa progresso apenas se concluiu tudo sem cancelamento
+            pending_queue = list(_embed_state["queue"])
+            if not pending_queue and not _embed_state["canceled"]:
+                try:
+                    if os.path.exists(BATCH_PROGRESS_FILE):
+                        os.remove(BATCH_PROGRESS_FILE)
+                except Exception:
+                    pass
+
+            total_done = len(_embed_state["completed"])
+            _embed_log(
+                f"Worker finalizado | "
+                f"Concluídos: {total_done} | "
+                f"Novos: {_embed_state['stats']['new']} | "
+                f"Erros: {_embed_state['stats']['errors']}"
+            )
+
+            # Sinaliza fim do trabalho ao dashboard com flush imediato (ignora throttle).
             try:
-                # HEARTBEAT: Antes da indexação
-                _embed_log(f"DEBUG: Iniciando _walk_and_index_sync para {project_id}")
-                stats = await asyncio.wait_for(
-                    asyncio.to_thread(_walk_and_index_sync, project_id, project_root, project_root),
-                    timeout=3600  # Timeout de 1 hora por projeto
+                _inventory.invalidate()
+                payload = _telemetry.snapshot(
+                    embed_state=_embed_state,
+                    rag_state=rag.state,
+                    batch_progress=_batch_progress_cache,
+                    server_extra=_server_extra,
                 )
-                
-                # HEARTBEAT: Após indexação, antes de descarregar VRAM
-                _embed_log(f"DEBUG: Indexação concluída. Solicitando descarga de VRAM para {project_id}")
-                await asyncio.to_thread(rag.ollama.unload_models)
-                _embed_log(f"DEBUG: VRAM descarregada com sucesso.")
-
-                if project_id not in _embed_state["completed"]:
-                    _embed_state["completed"].append(project_id)
-                completed_prev.add(project_id)
-                results[project_id] = {"status": "ok", **stats}
-                save_batch_progress({"completed": sorted(completed_prev), "results": results})
-
-                _embed_log(
-                    f"OK {project_id}: {stats['new']} novos | "
-                    f"{stats['cached']} cache | "
-                    f"{stats['skipped']} ignorados | "
-                    f"{stats['errors']} erros"
-                )
-
-            except Exception as e:
-                _embed_log(f"FALHA {project_id}: {str(e)[:120]}")
-                results[project_id] = {"status": "erro", "message": str(e)}
-                save_batch_progress({"completed": sorted(completed_prev), "results": results})
-                # Continua para o próximo projeto
-
-    finally:
-        await asyncio.to_thread(rag.ollama.unload_models)
-        _embed_state["running"] = False
-        _embed_state["current_project"] = None
-        _embed_state["current_file"] = None
-        _embed_state["finished_at"] = datetime.datetime.now().isoformat()
-
-        # Limpa progresso apenas se concluiu tudo sem cancelamento
-        pending_queue = list(_embed_state["queue"])
-        if not pending_queue and not _embed_state["canceled"]:
-            try:
-                if os.path.exists(BATCH_PROGRESS_FILE):
-                    os.remove(BATCH_PROGRESS_FILE)
+                _telemetry.flush(payload)
             except Exception:
                 pass
-
-        total_done = len(_embed_state["completed"])
-        _embed_log(
-            f"Worker finalizado | "
-            f"Concluídos: {total_done} | "
-            f"Novos: {_embed_state['stats']['new']} | "
-            f"Erros: {_embed_state['stats']['errors']}"
-        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -840,6 +899,7 @@ async def cancel_embed() -> str:
     _embed_state["running"] = False
     _embed_state["canceled"] = True
     _embed_state["queue"] = []  # Esvazia fila
+    _publish_telemetry()
 
     # Aguarda o arquivo atual terminar (não interrompe no meio)
     await asyncio.sleep(1.0)
@@ -1015,6 +1075,13 @@ async def ask_knowledge_base(question: str, project_id: str = None) -> str:
         project_id: Opcional. Filtra por projeto (ex: 'Rust Star', 'FoxOT', 'FoxClient').
                     Se omitido, busca em todos os projetos.
     """
+    _server_extra["last_query"] = {
+        "question": question[:200],
+        "project_id": project_id,
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    _publish_telemetry()
+
     result = await asyncio.to_thread(rag.search_and_generate, question, project_id)
     target = project_id if project_id else "TODOS OS PROJETOS"
 
@@ -1200,9 +1267,12 @@ async def clear_knowledge_base(project_id: str = None) -> str:
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
+_heartbeat_stop = threading.Event()
+
 def handle_exit():
     """Libera recursos ao encerrar o servidor."""
     logger.info("Encerrando MCP Rust Star Knowledge Server. Liberando VRAM...")
+    _heartbeat_stop.set()
     rag.ollama.unload_models()
 
 
@@ -1224,6 +1294,20 @@ if __name__ == "__main__":
         asyncio.set_event_loop(loop)
     
     loop.create_task(_windows_stdin_keepalive())
+
+    # Inicia thread de heartbeat (10s) para manter dashboard atualizado e detectar crash
+    _heartbeat_thread = threading.Thread(
+        target=_telemetry.heartbeat_loop,
+        args=(
+            _heartbeat_stop,
+            lambda: _embed_state,
+            lambda: rag.state,
+            lambda: _batch_progress_cache,
+            lambda: _server_extra,
+        ),
+        daemon=True
+    )
+    _heartbeat_thread.start()
     
     logger.info("=== MCP RUST STAR KNOWLEDGE SERVER INICIADO ===")
     mcp.run()

@@ -1,10 +1,7 @@
 import os
-import sys
 import uuid
 import hashlib
-import json
-import asyncio
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.vector_store_postgres import PostgresStore
@@ -12,9 +9,6 @@ from src.ollama_client import OllamaClient
 from src.config_manager import ConfigManager
 from tools.logger import logger
 
-# Calcula o caminho absoluto do root do projeto para o arquivo de estado
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-STATE_FILE = os.path.join(ROOT_DIR, "data", "current_indexing.json")
 
 class RAGService:
     def __init__(self):
@@ -30,7 +24,11 @@ class RAGService:
             "current_folder": "",
             "project_id": ""
         }
-        
+
+        # Callback opcional disparado após cada mutação de estado.
+        # main.py atribui um publisher de telemetria aqui.
+        self._on_state_change = None
+
         # Configuração de chunking
         settings = self.config.get_all().get("indexing", {})
         self.chunk_size = settings.get("chunk_size", int(os.getenv("CHUNK_SIZE", "8000")))
@@ -40,14 +38,17 @@ class RAGService:
         self._persist_state()
 
     def _persist_state(self):
-        """Salva o estado atual em um arquivo para o dashboard."""
-        try:
-            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
-        except Exception as e:
-            # Não usamos o logger aqui para evitar recursão infinita se o erro for no disco
-            sys.stderr.write(f"DEBUG: Erro ao persistir estado: {str(e)}\n")
+        """Notifica o observador (telemetry writer) com o estado atual.
+
+        A persistência em disco agora é responsabilidade exclusiva do
+        TelemetryWriter, que publica o snapshot unificado em
+        `data/dashboard_state.json`. Aqui só disparamos o callback.
+        """
+        if self._on_state_change is not None:
+            try:
+                self._on_state_change()
+            except Exception:
+                pass
 
     def update_state(self, **kwargs):
         """Atualiza o estado e persiste no disco."""
@@ -232,7 +233,7 @@ class RAGService:
 
         except Exception as e:
             logger.error(f"Erro ao indexar texto de {source}: {str(e)}")
-            _embed_state["stats"]["errors"] += 1
+            self.update_state(stats_inc={"errors": 1})
             raise
 
     def index_file_by_path(self, file_path: str, project_id: str, session_active: bool = False) -> str:
@@ -250,7 +251,7 @@ class RAGService:
             return self.index_text(text, file_path, project_id, file_path=file_path, session_active=session_active)
         except Exception as e:
             logger.error(f"Erro ao ler/indexar arquivo {file_path}: {str(e)}")
-            _embed_state["stats"]["errors"] += 1
+            self.update_state(stats_inc={"errors": 1})
             return f"Erro: {str(e)}"
 
     def search_and_generate(self, question: str, project_id: str = None) -> dict:

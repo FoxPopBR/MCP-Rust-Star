@@ -4,6 +4,7 @@ from pgvector.psycopg2 import register_vector
 import os
 import json
 import re
+from collections import Counter
 from tools.logger import logger
 
 class PostgresStore:
@@ -193,6 +194,56 @@ class PostgresStore:
         except Exception as e:
             logger.error(f"Erro ao consultar PostgresStore: {str(e)}")
             raise
+
+    def get_inventory_stats(self, project_id: str = None) -> list:
+        """Retorna estatísticas de (project_id, file_count, fragment_count, extensions_stats)."""
+        try:
+            tables = [self._get_table_name(project_id)] if project_id else self._get_all_tables()
+            if not tables:
+                return []
+                
+            results = []
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    for t in tables:
+                        # 1. Total de fragmentos
+                        cur.execute(f"SELECT COUNT(*) FROM {t}")
+                        frag_count = cur.fetchone()[0]
+                        
+                        # 2. Total de arquivos únicos e estatísticas de extensão
+                        # Usamos metadata->>'source' para identificar arquivos
+                        cur.execute(f"""
+                            SELECT 
+                                metadata->>'project_id' as pid,
+                                metadata->>'source' as src
+                            FROM {t}
+                            GROUP BY pid, src
+                        """)
+                        rows = cur.fetchall()
+                        
+                        file_count = len(rows)
+                        ext_counter = Counter()
+                        actual_pid = project_id or "global"
+                        
+                        for r_pid, r_src in rows:
+                            if r_pid: actual_pid = r_pid
+                            ext = os.path.splitext(r_src or "")[1].lower() or "(sem-ext)"
+                            ext_counter[ext] += 1
+                            
+                        results.append({
+                            "project_id": actual_pid,
+                            "file_count": file_count,
+                            "frag_count": frag_count,
+                            "extensions": dict(ext_counter)
+                        })
+            finally:
+                self._release_conn(conn)
+            
+            return sorted(results, key=lambda x: x["project_id"])
+        except Exception as e:
+            logger.error(f"Erro ao obter estatísticas do inventário: {str(e)}")
+            return []
 
     def list_sources(self, project_id: str = None) -> list:
         """Lista todos os arquivos únicos indexados."""
