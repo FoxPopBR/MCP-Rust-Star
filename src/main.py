@@ -1324,6 +1324,12 @@ def handle_exit():
     logger.info("Encerrando MCP Rust Star Knowledge Server. Liberando VRAM... OK")
 
 
+async def _windows_stdin_keepalive():
+    """Previne o deadlock do ProactorEventLoop ocioso no Windows com stdin."""
+    while True:
+        await asyncio.sleep(0.5)
+
+
 if __name__ == "__main__":
     import argparse
     import atexit
@@ -1362,6 +1368,17 @@ if __name__ == "__main__":
     startup_probes(rag, _bus, _HOST, _PORT, transport=_TRANSPORT)
 
     write_pid_file()
+
+    # No Windows, quando rodando em modo STDIO legado (IDE), injeta a task de keepalive 
+    # no event loop para prevenir travamentos de deadlock do ProactorEventLoop ocioso.
+    if _TRANSPORT == "stdio":
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        loop.create_task(_windows_stdin_keepalive())
 
     # Inicia thread de heartbeat (10s) para manter dashboard atualizado e detectar crash
     _heartbeat_thread = threading.Thread(

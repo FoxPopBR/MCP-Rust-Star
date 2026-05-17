@@ -60,49 +60,15 @@ O servidor é projetado para funcionar **out-of-the-box** sem configurações ma
 2. **Preferências do Usuário**: Salvas em `data/user_preferences.json` apenas quando você altera algo via comando.
 3. **Reset**: A qualquer momento, use `reset_server_settings()` para apagar suas mudanças e voltar ao estado original de fábrica.
 
-### 🔌 Configuração do Cliente MCP (IDE)
+### 🔌 Configuração do Cliente MCP (mcp_config_local.json)
+Para conectar ao servidor, use apenas as informações de conectividade. **NUNCA** coloque extensões ou filtros aqui:
 
-O modo de transporte padrão e **principal** do ecossistema é o **`streamable-http`**. Você deve iniciar o servidor executando `scripts/start_server.bat` (ou via terminal) antes de abrir a IDE.
-
-> [!WARNING]
-> **Incompatibilidade Crítica**: Se o servidor HTTP estiver rodando (porta `8765` ocupada), o **modo STDIO não funcionará** e abortará no boot (`sys.exit(1)`). Trata-se de uma probe de segurança para evitar que duas instâncias concorrentes corrompam a base de dados PostgreSQL e causem thrashing no Ollama.
-
-#### 1. Conexão HTTP (Recomendada / Principal)
-Conecta a sua IDE diretamente ao servidor rodando em background como cliente SSE/HTTP.
-
-**Cursor / Claude Desktop / Antigravity** (em `mcp_config.json` global da IDE):
-*Nota: Use obrigatoriamente a chave `"serverURL"` em camelCase. O uso de `"url"` causa falha de validação na IDE.*
 ```json
 {
   "mcpServers": {
-    "mcp-rust-star": {
-      "serverURL": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
-
-**VS Code** (no arquivo `.vscode/mcp.json` do seu workspace):
-```json
-{
-  "servers": {
-    "mcp-rust-star": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
-
-#### 2. Modo STDIO (Legado / Alternativo)
-*Apenas funciona se o servidor HTTP estiver desligado (porta `8765` livre).*
-```json
-{
-  "mcpServers": {
-    "mcp-rust-star": {
+    "rust-star-knowledge": {
       "command": "C:\\Phantasy\\MCP Rust Star\\.venv\\Scripts\\python.exe",
       "args": ["-m", "src.main"],
-      "cwd": "C:\\Phantasy\\MCP Rust Star",
       "env": { "PYTHONPATH": "C:\\Phantasy\\MCP Rust Star" }
     }
   }

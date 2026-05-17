@@ -21,8 +21,8 @@ mcp.run(transport="streamable-http")
 O servidor escuta em `127.0.0.1:8765` (configurável via `data/defaults.json`). O endpoint MCP fica em `http://127.0.0.1:8765/mcp`. Clientes configuram uma URL em vez de um comando de processo.
 
 Consequências diretas:
-- `_windows_stdin_keepalive` removido — o bloqueio de stdin não ocorre em transporte HTTP.
-- Regra 01 §2 ("stdout sacro") fica restrita ao modo STDIO legado; no modo HTTP o stdout não é o canal MCP.
+- `_windows_stdin_keepalive` restaurado no modo STDIO — para prevenir travamentos do ProactorEventLoop do Windows sob conexões herdadas (Fatia 3).
+- Regra 01 §2 ("stdout sacro") perfeitamente preservada — para garantir que o canal de dados JSON-RPC do MCP não seja quebrado em modo STDIO (Fatia 4).
 - `data/defaults.json` passa a ter seção `server` com `transport`, `host` e `port`.
 
 ## Configuração de cliente
@@ -76,7 +76,7 @@ Quando um IDE como Cursor ou VS Code invoca o servidor via configuração JSON (
 ## Consequências
 
 - Múltiplos clientes podem conectar simultaneamente ao mesmo servidor (modo HTTP).
-- `_windows_stdin_keepalive` removido de `src/main.py` — código de infraestrutura eliminado.
+- `_windows_stdin_keepalive` mantido condicionalmente para o transporte STDIO — preservando compatibilidade nativa com Windows.
 - Fase 6 (`/health`, `/events/stream`) pode ser implementada montando rotas Starlette na mesma app ASGI exposta pelo FastMCP.
 - Latência de transporte aumenta ligeiramente (HTTP vs pipe), irrelevante para ferramentas RAG com operações na escala de segundos.
 - Clientes HTTP precisam ser reconfigurados para URL. O `data/defaults.json` documenta host/porta canônicas.

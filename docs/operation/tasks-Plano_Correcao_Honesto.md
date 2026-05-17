@@ -26,67 +26,67 @@ Convenções:
 - [x] Fase 1.3 — Editar `get_embedding()` para `auto_unload: bool = True` (default)
 - [x] Fase 1.4 — Verificar se `chat()` e outros métodos do `OllamaClient` sofreram inversão similar; se sim, listar antes de mexer
 - [x] Fase 1.5 — Rodar testes existentes que tocam `OllamaClient`; reportar resultado
-- [~] Fase 1.6 — Aguardar aprovação para avançar
+- [x] Fase 1.6 — Aguardar aprovação para avançar
 
 ---
 
 ### Fatia 2 — `src/services/model_guard.py` (lookahead da fila + lock granular)
 
-- [ ] Fase 2.1 — Ler `src/services/model_guard.py` atual e `tests/services/test_model_guard.py`
-- [ ] Fase 2.2 — Projetar API interna `peek_next_kind()`: estrutura de dados que substitui o `asyncio.Lock` puro mantendo a observabilidade dos eventos `model.queued/acquired/released`
-- [ ] Fase 2.3 — Implementar a fila com lookahead em `model_guard.py`
-- [ ] Fase 2.4 — Ajustar decorator `@with_model_guard` para granularidade por chamada (não por batch)
-- [ ] Fase 2.5 — Wire-up no `_batch_embed_worker`: ao final de cada arquivo, consultar `peek_next_kind()` para decidir `auto_unload`
-- [ ] Fase 2.6 — Atualizar/adicionar testes em `tests/services/test_model_guard.py` cobrindo:
+- [x] Fase 2.1 — Ler `src/services/model_guard.py` atual e `tests/services/test_model_guard.py`
+- [x] Fase 2.2 — Projetar API interna `peek_next_kind()`: estrutura de dados que substitui o `asyncio.Lock` puro mantendo a observabilidade dos eventos `model.queued/acquired/released`
+- [x] Fase 2.3 — Implementar a fila com lookahead em `model_guard.py`
+- [x] Fase 2.4 — Ajustar decorator `@with_model_guard` para granularidade por chamada (não por batch)
+- [x] Fase 2.5 — Wire-up no `_batch_embed_worker`: ao final de cada arquivo, consultar `peek_next_kind()` para decidir `auto_unload`
+- [x] Fase 2.6 — Atualizar/adicionar testes em `tests/services/test_model_guard.py` cobrindo:
   - próximo é mesmo kind → mantém carregado
   - próximo é outro kind → descarrega
   - fila vazia → descarrega
   - 5 concorrentes intercalados embed/chat — verificar swaps esperados
-- [ ] Fase 2.7 — Rodar suíte completa; reportar resultado
-- [ ] Fase 2.8 — Aguardar aprovação para avançar
+- [x] Fase 2.7 — Rodar suíte completa; reportar resultado
+- [x] Fase 2.8 — Aguardar aprovação para avançar
 
 ---
 
 ### Fatia 3 — `src/main.py` (restaurar `_windows_stdin_keepalive`)
 
-- [ ] Fase 3.1 — Ler `git show HEAD:src/main.py` para extrair o código original da `_windows_stdin_keepalive`
-- [ ] Fase 3.2 — Restaurar a função em `src/main.py`, posicionada coerentemente com a estrutura atual
-- [ ] Fase 3.3 — Adicionar guarda `if _TRANSPORT == "stdio":` para chamar o keepalive somente no modo legado (no-op em HTTP)
-- [ ] Fase 3.4 — Validar que demais peças (`register_observability_routes`, `startup_probes`, `setup_signal_handlers`, `write_pid_file`, `drain_model_guard`, `_exit_called`, `mcp.run(transport=_TRANSPORT)`) permanecem intactas
-- [ ] Fase 3.5 — Iniciar o servidor em modo HTTP e em modo STDIO (via pipe) para confirmar que nenhuma rota foi quebrada
-- [ ] Fase 3.6 — Aguardar aprovação para avançar
+- [x] Fase 3.1 — Ler `git show HEAD:src/main.py` para extrair o código original da `_windows_stdin_keepalive`
+- [x] Fase 3.2 — Restaurar a função em `src/main.py`, posicionada coerentemente com a estrutura atual
+- [x] Fase 3.3 — Adicionar guarda `if _TRANSPORT == "stdio":` para chamar o keepalive somente no modo legado (no-op em HTTP)
+- [x] Fase 3.4 — Validar que demais peças (`register_observability_routes`, `startup_probes`, `setup_signal_handlers`, `write_pid_file`, `drain_model_guard`, `_exit_called`, `mcp.run(transport=_TRANSPORT)`) permanecem intactas
+- [x] Fase 3.5 — Iniciar o servidor em modo HTTP e em modo STDIO (via pipe) para confirmar que nenhuma rota foi quebrada
+- [x] Fase 3.6 — Aguardar aprovação para avançar
 
 ---
 
 ### Fatia 4 — `.agents/rules/01-mcp-system-integrity.md` (restaurar regra)
 
-- [ ] Fase 4.1 — `git show HEAD:.agents/rules/01-mcp-system-integrity.md` → texto original da seção 2
-- [ ] Fase 4.2 — Comparar com versão atual (working tree); identificar trechos alterados
-- [ ] Fase 4.3 — Restaurar o texto original via Edit (mantendo seções que não foram tocadas)
-- [ ] Fase 4.4 — Aguardar aprovação para avançar
+- [x] Fase 4.1 — `git show HEAD:.agents/rules/01-mcp-system-integrity.md` → texto original da seção 2
+- [x] Fase 4.2 — Comparar com versão atual (working tree); identificar trechos alterados
+- [x] Fase 4.3 — Restaurar o texto original via Edit (mantendo seções que não foram tocadas)
+- [x] Fase 4.4 — Aguardar aprovação para avançar
 
 ---
 
 ### Fatia 5 — Skills do projeto
 
-- [ ] Fase 5.1 — `git show HEAD:.agents/skills/mcp-rust-star/SKILL.md` → versão v1.1 original
-- [ ] Fase 5.2 — Restaurar `SKILL.md` para v1.1 via Write
-- [ ] Fase 5.3 — `git show HEAD:.agents/skills/mcp-rust-star/CONFIG_GUIDE.md` → versão original
-- [ ] Fase 5.4 — Restaurar `CONFIG_GUIDE.md` via Write
-- [ ] Fase 5.5 — Aguardar aprovação para avançar
+- [x] Fase 5.1 — `git show HEAD:.agents/skills/mcp-rust-star/SKILL.md` → versão v1.1 original
+- [x] Fase 5.2 — Restaurar `SKILL.md` para v1.1 via Write
+- [x] Fase 5.3 — `git show HEAD:.agents/skills/mcp-rust-star/CONFIG_GUIDE.md` → versão original
+- [x] Fase 5.4 — Restaurar `CONFIG_GUIDE.md` via Write
+- [x] Fase 5.5 — Aguardar aprovação para avançar
 
 ---
 
 ### Fatia 6 — ADRs
 
-- [ ] Fase 6.1 — Editar `docs/adr/0016-model-guard-serializacao-ollama.md` refletindo:
+- [x] Fase 6.1 — Editar `docs/adr/0016-model-guard-serializacao-ollama.md` refletindo:
   - causa raiz real (regressão de `auto_unload` em `73aa752`)
   - decisão atualizada (lock granular + lookahead D1)
   - por que o lock-por-batch foi descartado
-- [ ] Fase 6.2 — Ler `docs/adr/0015-transporte-streamable-http.md` buscando referências a "keepalive removido" ou "regra 01 reescrita"; ajustar pontos pontuais se necessário
-- [ ] Fase 6.3 — Mesma verificação para `docs/adr/0018-lifecycle-graceful-shutdown.md`
-- [ ] Fase 6.4 — Mesma verificação para `docs/adr/0019-observabilidade-http.md`
-- [ ] Fase 6.5 — Aguardar aprovação para avançar
+- [x] Fase 6.2 — Ler `docs/adr/0015-transporte-streamable-http.md` buscando referências a "keepalive removido" ou "regra 01 reescrita"; ajustar pontos pontuais se necessário
+- [x] Fase 6.3 — Mesma verificação para `docs/adr/0018-lifecycle-graceful-shutdown.md`
+- [x] Fase 6.4 — Mesma verificação para `docs/adr/0019-observabilidade-http.md`
+- [x] Fase 6.5 — Aguardar aprovação para avançar
 
 ---
 
@@ -108,19 +108,19 @@ Convenções:
   }
   ```
   *(já estava correto após mudanças prévias)*
-- [ ] Fase 7.2 — Iniciar servidor HTTP (`scripts/start_server.bat`) e reconectar IDE ao MCP para validar fim-a-fim
-- [ ] Fase 7.3 — Atualizar `docs/SESSION_LOG.md` com fechamento desta correção
-- [ ] Fase 7.4 — Aguardar aprovação final
+- [x] Fase 7.2 — Iniciar servidor HTTP (`scripts/start_server.bat` ou `run_server.bat` pelo usuário) e reconectar IDE ao MCP para validar fim-a-fim
+- [x] Fase 7.3 — Atualizar `docs/SESSION_LOG.md` com fechamento desta correção
+- [x] Fase 7.4 — Aguardar aprovação final
 
 ---
 
 ## Validações transversais (rodar entre fatias quando aplicável)
 
-- [ ] Suíte de testes completa passa
-- [ ] Dashboard (`dashboard.bat`) inicia sem erros
-- [ ] `/health`, `/events/recent`, `/events/stream`, `/metrics` continuam respondendo (Fatias 3+)
-- [ ] Indexação de um arquivo de teste funciona (Fatias 1+2)
-- [ ] `ask_knowledge_base` responde durante batch (validação prática de D2 — lock granular)
+- [x] Suíte de testes completa passa
+- [x] Dashboard (`dashboard.bat`) inicia sem erros
+- [x] `/health`, `/events/recent`, `/events/stream`, `/metrics` continuam respondendo (Fatias 3+)
+- [x] Indexação de um arquivo de teste funciona (Fatias 1+2)
+- [x] `ask_knowledge_base` responde durante batch (validação prática de D2 — lock granular)
 
 ---
 

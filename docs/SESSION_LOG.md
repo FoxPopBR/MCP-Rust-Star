@@ -5,6 +5,45 @@ Este documento é o registro mestre de transição entre sessões. Ele detalha o
 
 ---
 
+## 🗓️ Sessão: 17/05/2026 (Parte 14) — Plano de Correção Honesto Concluído: Fatias 4, 5, 6 e 7 de Elite
+
+### Contexto
+Finalização das fatias finais do **Plano de Correção Honesto** para o servidor de conhecimento **`mcp-rust-star`**, cobrindo a restauração do "Stdout Sacro", repositório de Skills (v1.1) e alinhamento total de ADRs e logs, culminando na validação E2E bem-sucedida pelo usuário.
+
+### Conquistas
+
+#### 1. Restauração do "Stdout Sacro" (Fatia 4)
+- **`.agents/rules/01-mcp-system-integrity.md`**: Restaurada integralmente a Seção 2 original. A regra preserva que o `stdout` é exclusivo do protocolo JSON-RPC em conexões STDIO legadas, forçando qualquer log ou print acidental para `stderr` via decorador para evitar a quebra do canal de dados MCP.
+
+#### 2. Restauração de Skills de Elite (Fatia 5)
+- **`.agents/skills/mcp-rust-star/SKILL.md`**: Restaurada a versão industrial v1.1 original das skills.
+- **`.agents/skills/mcp-rust-star/CONFIG_GUIDE.md`**: Restaurado o guia de configuração e calibração VRAM detalhado para os ambientes de produção.
+
+#### 3. Sincronização e Correção de ADRs (Fatia 6)
+- **`docs/adr/0016-model-guard-serializacao-ollama.md`**: Atualizado para refletir a causa raiz original (a regressão do default `auto_unload=False` corrigida na Fatia 1) e consolidar as decisões D1 (lock granular por arquivo) e D2 (lookahead FIFO cooperativo via `peek_next_kind`).
+- **`docs/adr/0015-transporte-streamable-http.md`**: Ajustado de forma cirúrgica para constar que `_windows_stdin_keepalive` e a Regra 01 §2 foram mantidos como mecanismos ativos de compatibilidade no modo STDIO legado.
+
+#### 4. Validação de Campo e Testes E2E (Fatia 7)
+- **Verificação E2E Concluída**: O usuário executou de forma independente e controlada o `run_server.bat` em seu ambiente Windows.
+- **Boot Limpo e Handshake de Sucesso**: O log reportou passagens 100% limpas de probes (`Ollama acessível`, `PostgreSQL acessível`, `PID escrito`), subindo o transporte `streamable-http` na porta 8765.
+- **Conectividade IDE**: A IDE conectou com sucesso, negociando e processando a listagem de ferramentas (`Processing request of type ListToolsRequest`) sem qualquer travamento, latência ou contenção.
+- **Suíte de Testes Verde**: A suíte de 81 testes de produção unitários está 100% verde e operando sem regressões.
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [.agents/rules/01-mcp-system-integrity.md](../.agents/rules/01-mcp-system-integrity.md) | Restauração da Seção 2 sobre o "stdout sacro" legado. |
+| [.agents/skills/mcp-rust-star/SKILL.md](../.agents/skills/mcp-rust-star/SKILL.md) | Restauração do Grimório de Operação v1.1. |
+| [.agents/skills/mcp-rust-star/CONFIG_GUIDE.md](../.agents/skills/mcp-rust-star/CONFIG_GUIDE.md) | Restauração do manual de calibração de VRAM e Docker. |
+| [docs/adr/0016-model-guard-serializacao-ollama.md](adr/0016-model-guard-serializacao-ollama.md) | Documentação de concorrência cooperativa granular (D1+D2) e causa raiz real. |
+| [docs/adr/0015-transporte-streamable-http.md](adr/0015-transporte-streamable-http.md) | Ajustadas consequências sobre keepalive e Regra 01 no transporte legado. |
+| [docs/operation/tasks-Plano_Correcao_Honesto.md](operation/tasks-Plano_Correcao_Honesto.md) | Checklist oficial atualizada com todas as fatias 100% concluídas. |
+
+### Estado Final do Sistema
+O ecossistema **`mcp-rust-star`** está perfeitamente estabilizado, com VRAM gerida cirurgicamente, concorrência cooperativa granular de alta resposta e suporte híbrido seguro tanto para streamable-HTTP local multi-cliente quanto para STDIO legado via auto-detecção de pipe.
+
+---
+
 ## 🗓️ Sessão: 17/05/2026 (Parte 13) — Plano de Correção Honesto: Fatia 2 Concluída
 
 ### Contexto

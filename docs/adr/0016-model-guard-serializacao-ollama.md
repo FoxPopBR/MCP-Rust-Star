@@ -22,9 +22,18 @@ Implementar `src/services/model_guard.py` com:
 - **Integração com EventBus**: emite `model.queued`, `model.acquired`, `model.released` — TelemetryWriter e dashboard consumirão esses eventos na Fase 4.
 - **Decorator `@with_model_guard(kind=...)`**: aplica o guard de forma transparente sem alterar a lógica interna das tools.
 
-## Decisão crítica: lock durante batch inteiro vs. entre arquivos
+## Decisão crítica (Revisada): Lock Granular por Arquivo com Lookahead FIFO vs. Lock Global por Batch
 
-`batch_index_projects` segura o lock **durante todo o batch**, não libera entre arquivos. Liberar entre arquivos abriria janela para `ask_knowledge_base` se intercalar entre dois arquivos do mesmo projeto, carregando o modelo de chat enquanto o modelo de embed ainda está "quente" no Ollama — violando o VRAM Eject Pattern. Consistência vale mais que throughput de interleaving nesse contexto single-user.
+A abordagem original de segurar o lock de embedding durante todo o lote (`_batch_embed_worker`) e toda a pasta (`index_directory`) causava travamentos severos: locks contínuos por horas na GPU do usuário e deadlocks de reentrabilidade caso ferramentas internas se chamassem.
+
+Decidimos migrar para uma **Fatia de Concorrência Cooperativa e Granular**:
+1. **Locks Granulares por Arquivo**: O lock do `ModelGuard` é adquirido e liberado de forma granular, apenas para cada arquivo individual indexado. Isso permite que uma pergunta RAG prioritária (`ask_knowledge_base`) se intercale de forma cooperativa entre dois arquivos sem ficar travada.
+2. **Lookahead FIFO (`peek_next_kind()`)**: O `ModelGuard` implementa lookahead na fila de espera. Ao término de cada arquivo indexado, a rotina espreita o próximo item da fila:
+   - Se a fila estiver vazia ou se o próximo `kind` for diferente de `"embed"` (ex: uma pergunta `"chat"` do usuário ou uma imagem `"vision"`), o modelo do Ollama é descarregado proativamente (`unload_models()`) para manter a VRAM limpa (VRAM Eject Pattern).
+   - Se o próximo item for outro `"embed"`, a descarga é pulada para reter o modelo na memória da GPU e maximizar o throughput da indexação em lote.
+
+## Causa Raiz e Retratação da Regressão do `auto_unload`
+Identificou-se que a regressão original que impulsionou o desenho do lock global por batch foi a desativação acidental do descarregamento automático do Ollama (`auto_unload=False` no `get_embedding()` no commit `73aa752`), fazendo com que o modelo de embedding persistisse na GPU e competisse com as consultas RAG. A restauração do default `auto_unload=True` (Fatia 1) eliminou a necessidade de locks por lote inteiro.
 
 ## Tools que recebem o decorator
 
