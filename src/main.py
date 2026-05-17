@@ -25,11 +25,12 @@ import json
 from collections import Counter
 from functools import wraps
 import threading
-import contextlib
 
 from mcp.server.fastmcp import FastMCP
 from src.services.rag_service import RAGService
 from src.services.telemetry_writer import TelemetryWriter, InventoryProvider
+from src.services.event_bus import get_event_bus
+from src.services.model_guard import with_model_guard, get_model_guard
 from tools.logger import logger
 
 # ─── Inicialização do servidor ─────────────────────────────────────────────────
@@ -43,26 +44,20 @@ os.makedirs("logs", exist_ok=True)
 PROJECTS_FILE = "data/projects.json"
 BATCH_PROGRESS_FILE = "data/batch_progress.json"
 
+_bus = get_event_bus()
 _inventory = InventoryProvider(rag.db)
-_telemetry = TelemetryWriter(inventory=_inventory)
 _batch_progress_cache: dict = {}
 _server_extra: dict = {"last_query": None}
+_telemetry = TelemetryWriter(
+    inventory=_inventory,
+    bus=_bus,
+    get_embed_state_fn=lambda: _embed_state,
+    get_rag_state_fn=lambda: rag.state,
+    get_batch_progress_fn=lambda: _batch_progress_cache,
+    get_server_extra_fn=lambda: _server_extra,
+)
 
-
-def _publish_telemetry() -> None:
-    """Publica snapshot atômico em data/dashboard_state.json. Throttled internamente."""
-    try:
-        _telemetry.write(
-            embed_state=_embed_state,
-            rag_state=rag.state,
-            batch_progress=_batch_progress_cache,
-            server_extra=_server_extra,
-        )
-    except Exception:
-        pass
-
-
-rag._on_state_change = _publish_telemetry
+rag._on_state_change = lambda: _bus.emit("rag.state.changed", {})
 
 
 # ─── Helpers de projetos ───────────────────────────────────────────────────────
@@ -113,7 +108,7 @@ def save_batch_progress(progress: dict) -> None:
         _inventory.invalidate()
     except Exception:
         pass
-    _publish_telemetry()
+    _bus.emit("embed.batch.progress", {})
 
 
 def get_project_for_path(file_path: str) -> str | None:
@@ -130,35 +125,28 @@ def get_project_for_path(file_path: str) -> str | None:
 # ─── Decorator de logging para ferramentas MCP ────────────────────────────────
 
 def mcp_tool_with_logging(func):
-    """
-    Registra a função como ferramenta MCP e:
-    - Loga o início e fim da execução (Heartbeat).
-    - Marca atividade na telemetria (refcount).
-    - Captura exceções, loga com traceback e retorna mensagem de erro amigável.
-    """
+    """Registra a função como ferramenta MCP com logging, telemetria e eventos."""
     @mcp.tool()
     @wraps(func)
     async def wrapper(*args, **kwargs):
         tool_name = func.__name__
         logger.info(f"[TOOL START] Executando '{tool_name}'...")
         start_time = datetime.datetime.now()
-        async with contextlib.AsyncExitStack() as stack:
-            # Note: _telemetry.activity() é síncrono, mas o wrapper é async.
-            # Como o context manager é simples e síncrono (apenas locks e ints),
-            # podemos usá-lo dentro de um bloco 'with' normal antes do await
-            # ou usar to_thread se fosse pesado. Aqui é seguro.
-            with _telemetry.activity():
-                try:
-                    result = await func(*args, **kwargs)
-                    duration = (datetime.datetime.now() - start_time).total_seconds()
-                    logger.info(f"[TOOL END] '{tool_name}' concluída em {duration:.2f}s")
-                    return result
-                except Exception as e:
-                    duration = (datetime.datetime.now() - start_time).total_seconds()
-                    logger.error(f"[TOOL ERROR] Falha em '{tool_name}' após {duration:.2f}s")
-                    logger.error_with_traceback(e, tool_name)
-                    _telemetry.set_activity_error(True)
-                    return f"Erro na ferramenta '{tool_name}': {str(e)}"
+        _bus.emit("tool.invoked", {"tool": tool_name})
+        with _telemetry.activity():
+            try:
+                result = await func(*args, **kwargs)
+                duration = (datetime.datetime.now() - start_time).total_seconds()
+                logger.info(f"[TOOL END] '{tool_name}' concluída em {duration:.2f}s")
+                _bus.emit("tool.completed", {"tool": tool_name, "duration_s": round(duration, 2)})
+                return result
+            except Exception as e:
+                duration = (datetime.datetime.now() - start_time).total_seconds()
+                logger.error(f"[TOOL ERROR] Falha em '{tool_name}' após {duration:.2f}s")
+                logger.error_with_traceback(e, tool_name)
+                _telemetry.set_activity_error(True)
+                _bus.emit("tool.failed", {"tool": tool_name, "error": str(e)[:200]})
+                return f"Erro na ferramenta '{tool_name}': {str(e)}"
     return wrapper
 
 
@@ -196,7 +184,7 @@ def _embed_log(msg: str) -> None:
     if len(_embed_state["log_lines"]) > MAX_LOG_LINES:
         _embed_state["log_lines"] = _embed_state["log_lines"][-MAX_LOG_LINES:]
     logger.info(f"[EMBED] {msg}")
-    _publish_telemetry()
+    _bus.emit("embed.log.appended", {})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -264,7 +252,7 @@ def _walk_and_index_sync(
 
             file_path = os.path.join(root, file)
             _embed_state["current_file"] = os.path.relpath(file_path, project_root)
-            _publish_telemetry()
+            _bus.emit("embed.file.processing", {})
 
             if rag.config.is_ignored(file_path, project_root):
                 skipped += 1
@@ -355,6 +343,7 @@ def _walk_and_index_sync(
 
 # ─── Worker de background ──────────────────────────────────────────────────────
 
+@with_model_guard(kind="embed")
 async def _batch_embed_worker(project_ids_initial: list, force: bool = False) -> None:
     """Worker assíncrono que roda como background task.
 
@@ -486,6 +475,7 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
             # Sinaliza fim do trabalho ao dashboard com flush imediato (ignora throttle).
             try:
                 _inventory.invalidate()
+                _bus.emit("embed.batch.finished", {})
                 payload = _telemetry.snapshot(
                     embed_state=_embed_state,
                     rag_state=rag.state,
@@ -531,6 +521,7 @@ async def list_projects() -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp_tool_with_logging
+@with_model_guard(kind="embed")
 async def index_file(path: str) -> str:
     """Indexa um arquivo individual (.rs, .cpp, .h, .lua, .py, .md, .pdf, etc.).
     Detecta o projeto automaticamente pelo caminho."""
@@ -547,6 +538,7 @@ async def index_file(path: str) -> str:
 
 
 @mcp_tool_with_logging
+@with_model_guard(kind="embed")
 async def index_directory(path: str, extension: str = None) -> str:
     """Indexa um diretório completo respeitando filtros de extensão e .gitignore.
 
@@ -899,7 +891,7 @@ async def cancel_embed() -> str:
     _embed_state["running"] = False
     _embed_state["canceled"] = True
     _embed_state["queue"] = []  # Esvazia fila
-    _publish_telemetry()
+    _bus.emit("embed.cancelled", {})
 
     # Aguarda o arquivo atual terminar (não interrompe no meio)
     await asyncio.sleep(1.0)
@@ -916,6 +908,7 @@ async def cancel_embed() -> str:
 
 
 @mcp_tool_with_logging
+@with_model_guard(kind="embed")
 async def retry_failed_files() -> str:
     """Re-indexa arquivos que falharam durante o último embed.
 
@@ -968,6 +961,7 @@ async def retry_failed_files() -> str:
 
 
 @mcp_tool_with_logging
+@with_model_guard(kind="vision")
 async def index_image(path: str) -> str:
     """Indexa uma imagem manualmente via Vision (PNG/JPG).
     Detecta o projeto automaticamente pelo caminho."""
@@ -985,6 +979,7 @@ async def index_image(path: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp_tool_with_logging
+@with_model_guard(kind="vision")
 async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: str = "") -> str:
     """Analisa um screenshot técnico do Rust Star / FoxOT usando Vision.
 
@@ -1067,6 +1062,7 @@ async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: s
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp_tool_with_logging
+@with_model_guard(kind="chat")
 async def ask_knowledge_base(question: str, project_id: str = None) -> str:
     """Consulta a base de conhecimento com RAG. Retorna resposta com citação de fontes.
 
@@ -1080,7 +1076,7 @@ async def ask_knowledge_base(question: str, project_id: str = None) -> str:
         "project_id": project_id,
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-    _publish_telemetry()
+    _bus.emit("rag.query.received", {"question": question[:200], "project_id": project_id})
 
     result = await asyncio.to_thread(rag.search_and_generate, question, project_id)
     target = project_id if project_id else "TODOS OS PROJETOS"
@@ -1298,13 +1294,7 @@ if __name__ == "__main__":
     # Inicia thread de heartbeat (10s) para manter dashboard atualizado e detectar crash
     _heartbeat_thread = threading.Thread(
         target=_telemetry.heartbeat_loop,
-        args=(
-            _heartbeat_stop,
-            lambda: _embed_state,
-            lambda: rag.state,
-            lambda: _batch_progress_cache,
-            lambda: _server_extra,
-        ),
+        args=(_heartbeat_stop,),
         daemon=True
     )
     _heartbeat_thread.start()

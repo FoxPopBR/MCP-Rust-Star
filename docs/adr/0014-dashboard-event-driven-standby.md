@@ -19,21 +19,38 @@ O `TelemetryWriter` no servidor implementa um contador de referência (`activity
 -   Isso permite que o servidor publique seu estado como `active`, `idle` ou `error`.
 
 ### 3. Heartbeat de 10 Segundos
-Uma thread dedicada no servidor publica a telemetria a cada 10 segundos, mesmo sem atividade.
--   Permite que o dashboard detecte "Server Offline" se o timestamp for muito antigo (> 30s).
--   Mantém o dashboard "vivo" sem a necessidade de polling agressivo.
+Uma thread dedicada no servidor publica a telemetria a cada `HEARTBEAT_SECONDS = 10s`, mesmo sem atividade.
+-   Permite que o dashboard detecte "Server Offline" se o timestamp for muito antigo (`STALE_THRESHOLD_SECONDS = 25s`, ou seja, > 2× heartbeat — tolera atraso de uma batida sem flicker).
+-   Mantém o dashboard "vivo" sem polling agressivo do lado UI.
 
-### 4. Feedback Visual (LEDs)
-O dashboard utiliza um sistema de cores para representar o estado:
--   🟢 **Verde**: Servidor Ativo (processando ferramenta ou embed).
--   🟡 **Amarelo**: Standby (Servidor ligado mas ocioso).
--   🔴 **Vermelho**: Erro detectado na última operação.
--   ⚫ **Cinza**: Servidor Offline (Heartbeat expirado).
+### 4. Feedback Visual (LED + Texto no Header)
+O header exibe LED **e** rótulo descritivo (não só cor — acessibilidade e legibilidade em terminais sem cor):
+-   🟢 **Servidor Ativo** (`#22c55e`) — processando ferramenta ou worker.
+-   🟡 **Servidor em Standby** (`#eab308`) — vivo, fresco, ocioso.
+-   🔴 **Erro no Servidor** (`#ef4444`) — última tool falhou; auto-limpa na próxima execução bem-sucedida.
+-   ⚫ **Servidor Offline** (`#6b7280`) — sem snapshot, `alive=false`, ou `ts` stale.
 
-### 5. Spinner Condicional
-O spinner de atividade (`⠋⠙⠹...`) agora só é exibido quando o estado é `active`. Em standby, ele é substituído por um ponto fixo (`·`), reduzindo a "poluição visual" e reforçando a sensação de ociosidade.
+### 5. Spinner = Fetching, NÃO Server Activity
+**Decisão revisada**: o spinner gira *apenas* enquanto o dashboard está esperando dados aparecerem (`fetcher.is_fetching` ou `not fetcher.ready`). Quando o servidor está `active` e estável, o LED verde + rótulo no header já comunicam — animar spinner ali confunde "trabalhando" com "carregando" e polui a tela.
+
+O `state_decider` é puramente um classificador semântico (status, label, color); a decisão de mostrar spinner pertence à UI e usa `fetcher.is_fetching` como fonte.
+
+### 6. Prioridade de Estados
+Ordem absoluta no decisor: `offline > error > active > standby`. Sem heartbeat fresco, qualquer outro campo é informação obsoleta — não importa o que o JSON dizia.
+
+## Implementação
+
+| Arquivo | Mudança |
+|---|---|
+| `src/services/telemetry_writer.py` | Schema v2; refcount `activity_count`; `heartbeat_loop()`; `server.activity` ∈ {idle,active,error} |
+| `src/main.py` | Decorator `mcp_tool_with_logging` envolve em `_telemetry.activity()`; auto-clear de error em sucesso; thread daemon `heartbeat_loop` |
+| `dashboard/state_decider.py` | Função pura `decide_state(snapshot) → {status,label,color}` |
+| `dashboard/fetcher.py` | Loop event-driven via `watchfiles.watch()` com `stop_event`; expõe `is_fetching` |
+| `dashboard/app.py` | LED + texto no header; spinner condicional via `fetcher.is_fetching` |
+| `tests/dashboard/test_state_decider.py` | Matriz table-driven (alive × activity × frescor) |
 
 ## Consequências
--   Redução significativa no uso de recursos do sistema quando o servidor está ocioso.
--   Melhor legibilidade do estado do agente (Agent Legibility).
--   Maior robustez na detecção de falhas do servidor.
+-   I/O do dashboard cai de 4 leituras/s para ~1 leitura cada 10s (steady-state idle) + leituras event-driven em mudança.
+-   Crash do servidor detectado em ≤ 25s sem polling pelo dashboard.
+-   Erros não ficam "stuck" — limpam-se naturalmente na próxima tool OK.
+-   Servidor é única fonte de verdade do `activity`; dashboard é puramente reativo.

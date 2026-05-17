@@ -30,6 +30,7 @@ class DataFetcher:
         self._data: dict = {"online": False, "ps": None, "state": None, "batch": None}
         self._log_lines: list[str] = []
         self._ready = False
+        self._is_fetching = True
 
         self._stop = threading.Event()
 
@@ -98,9 +99,11 @@ class DataFetcher:
         snap = self._read_snapshot()
         if snap is None:
             with self._lock:
-                # Se o arquivo sumiu, limpamos o snapshot mas mantemos ready
+                # Se o arquivo sumiu/inválido, sinalizamos fetching transitório:
+                # a UI mostra spinner enquanto esperamos próxima escrita do server.
                 self._data["raw_snapshot"] = None
                 self._ready = True
+                self._is_fetching = True
             return
 
         indexing = snap.get("indexing", {}) or {}
@@ -143,6 +146,7 @@ class DataFetcher:
             self._data["raw_snapshot"] = snap # Mantemos para o StateDecider
             self._log_lines = list(log_tail[-_LOG_TAIL_LINES:])
             self._ready = True
+            self._is_fetching = False
 
     # ── HTTP polling ───────────────────────────────────────────────────────────
 
@@ -186,6 +190,16 @@ class DataFetcher:
     def ready(self) -> bool:
         with self._lock:
             return self._ready
+
+    @property
+    def is_fetching(self) -> bool:
+        """True quando o dashboard está aguardando dados aparecerem.
+
+        Spinner deve girar enquanto isto for True (transient loading state).
+        Não significa "servidor trabalhando" — para isso use state_decider.
+        """
+        with self._lock:
+            return self._is_fetching
 
     def stop(self) -> None:
         self._stop.set()

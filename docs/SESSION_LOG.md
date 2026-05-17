@@ -5,6 +5,90 @@ Este documento é o registro mestre de transição entre sessões. Ele detalha o
 
 ---
 
+## 🗓️ Sessão: 16/05/2026 (Parte 5) — Fase 4: Telemetria via EventBus (ADR-0014)
+
+### Contexto
+Continuação do Plano de Estabilização v2.0. Fase 4 completa: TelemetryWriter orientado a eventos, remoção de `_publish_telemetry`, wire-up de `bus.emit` e 10 novos testes.
+
+Uma IA rogue reverteu o `src/main.py` via `git checkout --` durante a sessão anterior, apagando todas as mudanças das Fases 3, 2 e 4. A sessão foi dedicada a diagnosticar o dano e reaplicar todas as alterações.
+
+### Conquistas
+- **`src/services/telemetry_writer.py`** — Refatorado para aceitar `bus` + 4 lambdas de estado no construtor. Assina `embed.*`, `rag.*`, `model.*`, `tool.*`, `server.*`. Inclui `recent_events` (últimos 20) no snapshot. `heartbeat_loop` recebe um único argumento `stop_event`.
+- **`src/main.py`** — `_publish_telemetry()` removido inteiramente (0 ocorrências). Substituído por 5 chamadas cirúrgicas de `_bus.emit()` nos pontos relevantes. `_telemetry` inicializado com `bus=_bus` e as 4 lambdas de estado. Heartbeat thread corrigida para `args=(_heartbeat_stop,)`.
+- **`tests/dashboard/test_telemetry_event_driven.py`** — Novo arquivo com 10 testes TDD validando: assinatura automática (4 eventos distintos), writer sem bus, `recent_events` no snapshot, limite de 20 eventos, heartbeat thread, JSON atômico válido e schema v2.
+- **Wire-up mantido intacto**: `@with_model_guard` em 7 locais, `mcp_tool_with_logging` emitindo `tool.invoked/completed/failed`, `rag._on_state_change` via `bus.emit`.
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `src/services/telemetry_writer.py` | Refatorado — bus + lambdas, recent_events, heartbeat single-arg |
+| `src/main.py` | `_publish_telemetry` removido; 5x `_bus.emit`; telemetry dual-mode |
+| `tests/dashboard/test_telemetry_event_driven.py` | Novo — 10 testes TDD |
+| `docs/operation/tasks-Plano_Estabilização.md` | Fase 4 marcada como concluída |
+
+### Resultado dos testes
+**55/55 testes passando** (10 event-driven + 14 EventBus + 10 ModelGuard + 3 live_repaints + 18 state_decider).
+
+### Próximo passo
+**Fase 1 — Transporte HTTP**: ADR-0015, streamable-http transport, `data/defaults.json` com seção server, remoção de `_windows_stdin_keepalive`, scripts de start.
+
+---
+
+## 🗓️ Sessão: 16/05/2026 (Parte 4) — Fase 2: ModelGuard (ADR-0016)
+
+### Contexto
+Continuação do Plano de Estabilização v2.0. Fase 2 completa: ADR + testes TDD + implementação + wire-up nas tools.
+
+### Conquistas
+- **ADR-0016** (`docs/adr/0016-model-guard-serializacao-ollama.md`) — documentado; decisão crítica de segurar o lock durante o batch inteiro.
+- **`src/services/model_guard.py`** — implementado: `asyncio.Lock` FIFO, `stats()`, eventos `model.queued/acquired/released`, decorator `@with_model_guard`, singleton `get_model_guard()`.
+- **`tests/services/test_model_guard.py`** — 10 testes TDD cobrindo: acquire/release básico, serialização de 2 e 5 tasks concorrentes, queue_depth, total_acquires, eventos model.*, decorator, singleton.
+- **Wire-up em `src/main.py`** — decorator aplicado em 7 tools Ollama e em `_batch_embed_worker` (segura lock durante batch inteiro):
+  - `kind="embed"`: `index_file`, `index_directory`, `retry_failed_files`, `_batch_embed_worker`
+  - `kind="vision"`: `index_image`, `analyze_screenshot`
+  - `kind="chat"`: `ask_knowledge_base`
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `src/services/model_guard.py` | Novo — implementação completa |
+| `tests/services/test_model_guard.py` | Novo — 10 testes TDD |
+| `docs/adr/0016-model-guard-serializacao-ollama.md` | Novo — ADR da decisão |
+| `src/main.py` | Import `with_model_guard, get_model_guard`; 8 pontos de wire-up |
+
+### Resultado dos testes
+24/24 testes passando (`tests/services/` — 14 EventBus + 10 ModelGuard).
+
+### Próximo passo
+**Fase 4 — TelemetryWriter orientado a eventos**: refatorar `src/services/telemetry_writer.py` para assinar o EventBus em vez de ser chamado diretamente.
+
+---
+
+## 🗓️ Sessão: 16/05/2026 (Parte 3) — Fase 3: EventBus In-Process (ADR-0017)
+
+### Contexto
+Início da execução do Plano de Estabilização v2.0 (`docs/operation/2026-05-16Plano Estabilização MCP Rust Star v2.0.md`). Ordem de execução: **3 → 2 → 4 → 1 → 5 → 6**.
+
+### Conquistas
+- **ADR-0017** (`docs/adr/0017-event-bus-in-process.md`) escrito — justifica pub/sub in-process, cataloga todos os namespaces de eventos, descarta alternativas (asyncio.Queue fan-out, blinker).
+- **`src/services/event_bus.py`** implementado: singleton `get_event_bus()`, `subscribe`/`unsubscribe`, `emit` (síncrono, handlers async via `create_task`), `emit_async` (aguarda todos), wildcards via `fnmatch`, ring buffer 500 eventos, isolamento de erros por handler.
+- **`tests/services/test_event_bus.py`** — 14 testes verdes cobrindo todos os contratos públicos: subscribe, emit básico, wildcards, unsubscribe, isolamento de exceção, ring buffer (order, limit, filter, overflow), emit_async, singleton.
+- **Wire-up em `src/main.py`** — decorator `mcp_tool_with_logging` emite agora automaticamente `tool.invoked`, `tool.completed` e `tool.failed` para todas as tools MCP, sem alterar nenhuma tool individualmente.
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `src/services/event_bus.py` | Novo — implementação completa do EventBus |
+| `tests/services/__init__.py` | Novo — pacote de testes de serviços |
+| `tests/services/test_event_bus.py` | Novo — 14 testes TDD |
+| `docs/adr/0017-event-bus-in-process.md` | Novo — ADR da decisão |
+| `src/main.py` | Import de `get_event_bus`; 3 emissões de eventos no decorator |
+
+### Próximo passo
+**Fase 2 — ModelGuard**: ADR-0016 + `src/services/model_guard.py` + decorator `@with_model_guard`.
+
+---
+
 ## 🗓️ Sessão: 16/05/2026 (Parte 2) - Dashboard Standby + Event-Driven (ADR-0014)
 
 ### 1. Principais Conquistas e Fatos

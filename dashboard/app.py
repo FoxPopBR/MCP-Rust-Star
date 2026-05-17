@@ -488,9 +488,8 @@ class DashboardApp:
             box=ROUNDED,
         )
 
-    def generate_footer(self, state: dict | None, batch: dict | None, v_state: dict) -> Panel:
+    def generate_footer(self, state: dict | None, batch: dict | None, v_state: dict, s_active: bool = False) -> Panel:
         is_busy = bool(state and state.get("current_file"))
-        s_active = v_state["spinner"]
 
         if self._completed_at and (time.time() - self._completed_at) < 30:
             text = Text(justify="center")
@@ -540,7 +539,10 @@ class DashboardApp:
         batch = data["batch"]
         raw_snap = data.get("raw_snapshot")
         v_state = decide_state(raw_snap)
-        s_active = v_state["spinner"]
+        # Spinner = transient fetching, NÃO server activity. Gira só enquanto
+        # esperamos um snapshot aparecer; uma vez estabilizado, o LED+texto
+        # do header já comunica o estado sem animação ruidosa.
+        s_active = self.fetcher.is_fetching or not self.fetcher.ready
 
         # Detecção de conclusão fora das funções de render (sem efeitos colaterais).
         self._detect_completion(state, batch)
@@ -557,7 +559,7 @@ class DashboardApp:
         self._apply_layout(batch_active)
 
         self.layout["header"].update(self.generate_header(data))
-        self.layout["footer"].update(self.generate_footer(state, batch, v_state))
+        self.layout["footer"].update(self.generate_footer(state, batch, v_state, s_active))
         self.layout["side_top"].update(self.generate_monitor_panel(data, s_active))
         self.layout["side_bottom"].update(self.generate_inventory_panel(state, s_active))
 

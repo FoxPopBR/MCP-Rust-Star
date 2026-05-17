@@ -10,6 +10,8 @@ Princípios:
 - Escrita atômica via .tmp + os.replace (não corrompe se interromper).
 - Inventory (Postgres) consultado com cache TTL — não consulta a cada frame.
 - Falha de telemetria NUNCA derruba o servidor: try/except largo no persist.
+- (ADR-0014/0017) Orientado a eventos: assina EventBus e reage a embed.*, rag.*,
+  model.*, tool.*, server.*. O heartbeat garante liveness mesmo sem eventos.
 """
 
 from __future__ import annotations
@@ -20,8 +22,7 @@ import json
 import os
 import threading
 import time
-from collections import Counter
-from typing import Any
+from typing import Any, Callable
 
 from tools.logger import logger
 
@@ -55,7 +56,6 @@ class InventoryProvider:
                 return self._cache
 
         try:
-            # Novo método que retorna estatísticas agregadas (file_count + frag_count)
             stats_list = self._db.get_inventory_stats()
         except Exception as e:
             logger.warning(f"InventoryProvider: get_inventory_stats falhou: {e}")
@@ -65,8 +65,8 @@ class InventoryProvider:
         for item in stats_list:
             pid = item["project_id"]
             result[pid] = {
-                "total": item["file_count"],    # Mantemos 'total' como arquivos para compatibilidade
-                "fragments": item["frag_count"], # Nova chave para fragmentos reais
+                "total": item["file_count"],
+                "fragments": item["frag_count"],
                 "extensions": item["extensions"]
             }
 
@@ -84,14 +84,22 @@ class InventoryProvider:
 class TelemetryWriter:
     """Publica snapshots de telemetria em `dashboard_state.json`.
 
-    O servidor chama `write(embed_state, rag_state)` em pontos de mutação.
-    O writer faz throttle (250ms) e escrita atômica internamente.
+    Pode ser acionado de dois modos complementares (writer dual):
+    1. Orientado a eventos: assina EventBus e reage a cada evento relevante.
+    2. Heartbeat: thread escreve a cada HEARTBEAT_SECONDS para manter liveness.
+
+    O servidor pode ainda chamar write() diretamente para flush imediato.
     """
 
     def __init__(
         self,
         state_file: str = DASHBOARD_STATE_FILE,
         inventory: InventoryProvider | None = None,
+        bus=None,
+        get_embed_state_fn: Callable[[], dict] | None = None,
+        get_rag_state_fn: Callable[[], dict] | None = None,
+        get_batch_progress_fn: Callable[[], dict] | None = None,
+        get_server_extra_fn: Callable[[], dict] | None = None,
     ) -> None:
         self._state_file = state_file
         self._inventory = inventory
@@ -104,7 +112,43 @@ class TelemetryWriter:
         self._activity_count = 0
         self._activity_error = False
 
+        self._bus = bus
+        self._get_embed_state = get_embed_state_fn
+        self._get_rag_state = get_rag_state_fn
+        self._get_batch_progress = get_batch_progress_fn
+        self._get_server_extra = get_server_extra_fn
+
         os.makedirs(os.path.dirname(self._state_file) or ".", exist_ok=True)
+
+        if bus is not None:
+            for pattern in ("embed.*", "rag.*", "model.*", "tool.*", "server.*"):
+                bus.subscribe(pattern, self._on_event)
+
+    # ------------------------------------------------------------------
+    # Event-driven trigger
+    # ------------------------------------------------------------------
+
+    def _on_event(self, _payload: dict) -> None:
+        """Handler genérico: qualquer evento relevante dispara escrita throttled."""
+        self._trigger_write()
+
+    def _trigger_write(self) -> None:
+        """Escreve snapshot usando os accessors armazenados (se disponíveis)."""
+        if self._get_embed_state is None or self._get_rag_state is None:
+            return
+        try:
+            self.write(
+                embed_state=self._get_embed_state(),
+                rag_state=self._get_rag_state(),
+                batch_progress=self._get_batch_progress() if self._get_batch_progress else None,
+                server_extra=self._get_server_extra() if self._get_server_extra else None,
+            )
+        except Exception as e:
+            logger.warning(f"TelemetryWriter._trigger_write falhou: {e}")
+
+    # ------------------------------------------------------------------
+    # Activity tracking (refcount)
+    # ------------------------------------------------------------------
 
     def _current_activity_label(self) -> str:
         with self._activity_lock:
@@ -137,26 +181,28 @@ class TelemetryWriter:
         finally:
             self.exit_activity()
 
-    def heartbeat_loop(self, stop_event: threading.Event, get_embed_state_fn, get_rag_state_fn, get_batch_progress_fn, get_server_extra_fn) -> None:
+    # ------------------------------------------------------------------
+    # Heartbeat
+    # ------------------------------------------------------------------
+
+    def heartbeat_loop(self, stop_event: threading.Event) -> None:
         """Loop de heartbeat que toca o arquivo a cada HEARTBEAT_SECONDS."""
         logger.debug(f"TelemetryWriter: Heartbeat iniciado (intervalo={HEARTBEAT_SECONDS}s)")
         while not stop_event.is_set():
             try:
-                self.write(
-                    embed_state=get_embed_state_fn(),
-                    rag_state=get_rag_state_fn(),
-                    batch_progress=get_batch_progress_fn(),
-                    server_extra=get_server_extra_fn(),
-                )
+                self._trigger_write()
             except Exception as e:
                 logger.warning(f"TelemetryWriter: Falha no heartbeat: {e}")
-            
-            # Dorme em pequenos pedaços para responder rápido ao stop_event
+
             for _ in range(int(HEARTBEAT_SECONDS * 2)):
                 if stop_event.is_set():
                     break
                 time.sleep(0.5)
         logger.debug("TelemetryWriter: Heartbeat finalizado.")
+
+    # ------------------------------------------------------------------
+    # Snapshot + persist
+    # ------------------------------------------------------------------
 
     def snapshot(
         self,
@@ -179,13 +225,19 @@ class TelemetryWriter:
         log_lines = embed_state.get("log_lines", []) or []
         log_tail = list(log_lines[-LOG_TAIL_LINES:])
 
+        recent_events: list[dict] = []
+        if self._bus is not None:
+            try:
+                recent_events = self._bus.history("*", limit=20)
+            except Exception:
+                pass
+
         return {
             "version": SCHEMA_VERSION,
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-            "ts_monotonic": time.monotonic(),
-            "activity": self._current_activity_label(),
             "server": {
                 "alive": True,
+                "activity": self._current_activity_label(),
                 "last_query": server_extra.get("last_query"),
             },
             "indexing": {
@@ -212,6 +264,7 @@ class TelemetryWriter:
             },
             "inventory": inventory,
             "log_tail": log_tail,
+            "recent_events": recent_events,
         }
 
     def persist(self, payload: dict[str, Any]) -> None:
@@ -227,6 +280,7 @@ class TelemetryWriter:
                 return
             self._last_write_ts = now
             self._pending_payload = None
+            self._last_payload = payload
 
         self._atomic_write(payload)
 
@@ -236,6 +290,8 @@ class TelemetryWriter:
             target = payload or self._pending_payload
             self._last_write_ts = time.monotonic()
             self._pending_payload = None
+            if target is not None:
+                self._last_payload = target
         if target is not None:
             self._atomic_write(target)
 
