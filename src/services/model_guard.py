@@ -87,6 +87,12 @@ class ModelGuard:
     # Observabilidade
     # ------------------------------------------------------------------
 
+    def peek_next_kind(self) -> Kind | None:
+        """Retorna o tipo (kind) do próximo item na fila de espera, se houver."""
+        if self._queue:
+            return self._queue[0]["kind"]
+        return None
+
     def stats(self) -> dict:
         return {
             "holder": dict(self._holder) if self._holder else None,

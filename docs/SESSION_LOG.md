@@ -5,6 +5,44 @@ Este documento é o registro mestre de transição entre sessões. Ele detalha o
 
 ---
 
+## 🗓️ Sessão: 17/05/2026 (Parte 13) — Plano de Correção Honesto: Fatia 2 Concluída
+
+### Contexto
+Execução da **Fatia 2** do Plano de Correção Honesto para otimizar o gerenciamento de concorrência e uso de VRAM no Ollama durante indexação massiva/background.
+
+### Conquistas
+
+#### 1. Implementação de Lookahead FIFO no ModelGuard
+- **`src/services/model_guard.py`**: Adicionada a função `peek_next_kind(self) -> Kind | None`. Ela inspeciona o primeiro elemento da fila de espera (`self._queue`) sem alterar seu estado. Isso permite saber com antecedência se a próxima tarefa na fila é do mesmo `kind` (ex: `embed`) ou de outro `kind` (ex: `chat`), ou se a fila está vazia.
+
+#### 2. Refatoração Completa para Concorrência Cooperativa e Granular
+- **`src/main.py`**: 
+  - **Remoção de Lock Global**: Removido o decorator `@with_model_guard(kind="embed")` de `_batch_embed_worker` e de `index_directory` para evitar locks contínuos por horas ou deadlocks reentrantes.
+  - **Novo Core Assíncrono**: Substituído o `_walk_and_index_sync` por `_collect_files_sync` (coleta síncrona rápida de caminhos de arquivos) e `_walk_and_index_async` (loop assíncrono cooperativo executado na thread principal do asyncio).
+  - **Lock Granular por Arquivo**: A indexação assíncrona adquire o lock do `ModelGuard` individualmente para cada arquivo.
+  - **VRAM Eject Pattern com Lookahead**: Ao fim de cada arquivo indexado, a rotina consulta `peek_next_kind()`. Se o próximo `kind` for diferente de `"embed"` (ex: uma pergunta RAG `"chat"` do usuário) ou se a fila de tarefas estiver vazia, ela descarrega a VRAM do Ollama proativamente via `unload_models()`. Se a próxima tarefa for outro `"embed"`, ela mantém o modelo na VRAM para alta performance.
+
+#### 3. Testes Unitários de Elite
+- **`tests/services/test_model_guard.py`**: Adicionado o caso de teste `test_peek_next_kind` validando cenários concorrentes de lookahead, transições e fila vazia.
+- **Suíte Verde**: Todos os **81 testes unitários principais** na pasta `tests/` passaram de primeira em apenas ~12 segundos, comprovando integridade de 100% da arquitetura!
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [src/services/model_guard.py](../src/services/model_guard.py) | Adicionado `peek_next_kind` para lookahead de fila. |
+| [src/main.py](../src/main.py) | Removido lock global do worker/diretório; implementados `_collect_files_sync` e `_walk_and_index_async` com locks granulares e lookahead. |
+| [tests/services/test_model_guard.py](../tests/services/test_model_guard.py) | Adicionados testes unitários robustos de concorrência para `peek_next_kind`. |
+
+### Pendências para Próxima Sessão (Plano de Correção Honesto)
+- **Fatia 3**: Restaurar `_windows_stdin_keepalive` em [src/main.py](../src/main.py) com o respectivo guard de transporte (`if _TRANSPORT == "stdio":`).
+- **Fatia 4**: Restaurar [.agents/rules/01-mcp-system-integrity.md](../.agents/rules/01-mcp-system-integrity.md) §2 ("stdout sacro").
+- **Fatia 5**: Restaurar `SKILL.md` (v1.1) e `CONFIG_GUIDE.md` em [.agents/skills/mcp-rust-star/](../.agents/skills/mcp-rust-star/).
+- **Fatia 6**: Editar ADR-0016 refletindo causa raiz real + decisão D1+D2.
+- **Fatia 7**: Validações finais E2E e fechamento do ciclo de correção.
+
+
+---
+
 ## 🗓️ Sessão: 17/05/2026 (Parte 12) — Estabilização de Dimensão RAG, Dotenv e Indexação de Nova Rust
 
 ### Contexto

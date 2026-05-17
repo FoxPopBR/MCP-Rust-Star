@@ -191,3 +191,29 @@ def test_get_model_guard_retorna_mesma_instancia() -> None:
     a = get_model_guard()
     b = get_model_guard()
     assert a is b
+
+
+# ---------------------------------------------------------------------------
+# 7. peek_next_kind lookahead
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_peek_next_kind(guard: ModelGuard) -> None:
+    # Sem ninguém na fila, retorna None
+    assert guard.peek_next_kind() is None
+
+    async def ocupante():
+        async with guard.acquire("ocupante", kind="embed"):
+            await asyncio.sleep(0.05)
+            # Durante a execução do ocupante, o entrante deve estar na fila
+            assert guard.peek_next_kind() == "chat"
+
+    async def entrante():
+        await asyncio.sleep(0.01)
+        async with guard.acquire("entrante", kind="chat"):
+            pass
+
+    await asyncio.gather(ocupante(), entrante())
+
+    # Após liberar a fila inteira, retorna None
+    assert guard.peek_next_kind() is None

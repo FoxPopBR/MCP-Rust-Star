@@ -208,14 +208,44 @@ def _embed_log(msg: str) -> None:
 # CORE DE INDEXAÇÃO (com atualização de estado + retry)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _walk_and_index_sync(
+def _collect_files_sync(abs_path: str, project_root: str, extension: str = None) -> list[str]:
+    """Coleta todos os caminhos absolutos de arquivos elegíveis para indexação."""
+    settings = rag.config.get_all()
+    vision_cfg = settings["vision"]
+    image_exts = set(vision_cfg.get("allowed_image_extensions", []))
+    
+    eligible_files = []
+    for root, dirs, files in os.walk(abs_path):
+        if not _embed_state["running"]:
+            break
+        # Poda diretórios ignorados in-place
+        dirs[:] = [d for d in dirs if not rag.config.is_ignored(os.path.join(root, d), project_root)]
+        for file in files:
+            file_path = os.path.join(root, file)
+            if not rag.config.is_ignored(file_path, project_root):
+                if extension and not file.lower().endswith(extension.lower()):
+                    continue
+                file_ext = os.path.splitext(file)[1].lower()
+                if file_ext in image_exts:
+                    file_abs = os.path.abspath(file_path)
+                    is_auto_folder = any(
+                        file_abs.startswith(os.path.abspath(f) + os.sep)
+                        for f in vision_cfg.get("auto_index_folders", [])
+                    )
+                    if not (vision_cfg.get("auto_index_images", False) or is_auto_folder):
+                        continue
+                eligible_files.append(file_path)
+    return eligible_files
+
+
+async def _walk_and_index_async(
     project_id: str,
     abs_path: str,
     project_root: str,
     extension: str = None,
     max_retries: int = 2,
 ) -> dict:
-    """Walk-and-index rodando 100% em Thread separada."""
+    """Core assíncrono de indexação rodando no Event Loop principal de forma cooperativa."""
     settings = rag.config.get_all()
     vision_cfg = settings["vision"]
     image_exts = set(vision_cfg.get("allowed_image_extensions", []))
@@ -227,60 +257,25 @@ def _walk_and_index_sync(
     _embed_log(f"Início: {project_id} | {abs_path}")
 
     # ── PRE-SCAN RÁPIDO PARA ESTATÍSTICAS ─────────────────────────────────────
-    total_eligible = 0
     _embed_log("Executando pré-scan de arquivos elegíveis...")
-    for root, dirs, files in os.walk(abs_path):
-        if not _embed_state["running"]: break
-        dirs[:] = [d for d in dirs if not rag.config.is_ignored(os.path.join(root, d), project_root)]
-        for file in files:
-            file_path = os.path.join(root, file)
-            if not rag.config.is_ignored(file_path, project_root):
-                if extension and not file.lower().endswith(extension.lower()): continue
-                file_ext = os.path.splitext(file)[1].lower()
-                if file_ext in image_exts:
-                    file_abs = os.path.abspath(file_path)
-                    is_auto_folder = any(
-                        file_abs.startswith(os.path.abspath(f) + os.sep)
-                        for f in vision_cfg.get("auto_index_folders", [])
-                    )
-                    if not (vision_cfg.get("auto_index_images", False) or is_auto_folder):
-                        continue
-                total_eligible += 1
-
-    _embed_state["total_expected"] = total_eligible
-    _embed_log(f"Pré-scan concluído: {total_eligible} arquivos elegíveis.")
+    eligible_files = await asyncio.to_thread(_collect_files_sync, abs_path, project_root, extension)
+    
+    _embed_state["total_expected"] = len(eligible_files)
+    _embed_log(f"Pré-scan concluído: {len(eligible_files)} arquivos elegíveis.")
 
     # ── INDEXAÇÃO REAL ────────────────────────────────────────────────────────
-    for root, dirs, files in os.walk(abs_path):
-        # Verifica cancelamento antes de cada diretório
+    for file_path in eligible_files:
         if not _embed_state["running"]:
             _embed_log(f"Cancelado em: {project_id}")
             break
 
-        # Poda diretórios ignorados in-place
-        dirs[:] = [
-            d for d in dirs
-            if not rag.config.is_ignored(os.path.join(root, d), project_root)
-        ]
+        _embed_state["current_file"] = os.path.relpath(file_path, project_root)
+        _bus.emit("embed.file.processing", {})
 
-        for file in files:
-            if not _embed_state["running"]:
-                break
-
-            file_path = os.path.join(root, file)
-            _embed_state["current_file"] = os.path.relpath(file_path, project_root)
-            _bus.emit("embed.file.processing", {})
-
-            if rag.config.is_ignored(file_path, project_root):
-                skipped += 1
-                rag.update_state(stats_inc={"skipped": 1})
-                continue
-
-            if extension and not file.lower().endswith(extension.lower()):
-                continue
-
+        # Serializa via ModelGuard de forma granular para esta chamada específica
+        async with get_model_guard().acquire("batch_embed", kind="embed"):
             try:
-                file_ext = os.path.splitext(file)[1].lower()
+                file_ext = os.path.splitext(file_path)[1].lower()
 
                 # Imagens: só se Vision estiver ativo
                 if file_ext in image_exts:
@@ -290,7 +285,7 @@ def _walk_and_index_sync(
                         for f in vision_cfg.get("auto_index_folders", [])
                     )
                     if vision_cfg.get("auto_index_images", False) or is_auto_folder:
-                        rag.index_image(file_path, project_id)
+                        await asyncio.to_thread(rag.index_image, file_path, project_id)
                         vision_count += 1
                         count += 1
                         _embed_state["stats"]["new"] += 1
@@ -300,7 +295,7 @@ def _walk_and_index_sync(
                         rag.update_state(stats_inc={"skipped": 1})
                     continue
 
-                result = rag.index_file_by_path(file_path, project_id, session_active=True)
+                result = await asyncio.to_thread(rag.index_file_by_path, file_path, project_id, session_active=True)
                 if "Cache Hit" in result:
                     cached += 1
                     _embed_state["stats"]["cached"] += 1
@@ -320,6 +315,12 @@ def _walk_and_index_sync(
                 errors += 1
                 _embed_state["stats"]["errors"] += 1
 
+            # LOOKAHEAD DO MODEL GUARD: descarrega proativamente se houver tarefa de tipo diferente ou fila vazia
+            next_kind = get_model_guard().peek_next_kind()
+            if next_kind != "embed":
+                _embed_log(f"DEBUG: Lookahead detectou próxima tarefa de kind '{next_kind}'. Descarregando VRAM...")
+                await asyncio.to_thread(rag.ollama.unload_models)
+
     # ── RETRY AUTOMÁTICO ──────────────────────────────────────────────────────
     if retry_queue and max_retries > 0:
         _embed_log(f"Retry: {len(retry_queue)} arquivo(s) com falha em '{project_id}'")
@@ -327,18 +328,26 @@ def _walk_and_index_sync(
         still_failed = []
 
         for item in retry_queue:
-            try:
-                result = rag.index_file_by_path(item["file"], project_id, session_active=True)
-                if result:
-                    file_ext = os.path.splitext(item["file"])[1].lower()
-                    retry_success += 1
-                    errors -= 1
-                    _embed_state["stats"]["errors"] -= 1
-                    count += 1
-                    _embed_state["stats"]["new"] += 1
-                    _embed_state["stats_by_ext"][file_ext] = _embed_state["stats_by_ext"].get(file_ext, 0) + 1
-            except Exception as e:
-                still_failed.append({**item, "error": str(e)})
+            if not _embed_state["running"]:
+                break
+
+            async with get_model_guard().acquire("batch_embed", kind="embed"):
+                try:
+                    result = await asyncio.to_thread(rag.index_file_by_path, item["file"], project_id, session_active=True)
+                    if result:
+                        file_ext = os.path.splitext(item["file"])[1].lower()
+                        retry_success += 1
+                        errors -= 1
+                        _embed_state["stats"]["errors"] -= 1
+                        count += 1
+                        _embed_state["stats"]["new"] += 1
+                        _embed_state["stats_by_ext"][file_ext] = _embed_state["stats_by_ext"].get(file_ext, 0) + 1
+                except Exception as e:
+                    still_failed.append({**item, "error": str(e)})
+
+                next_kind = get_model_guard().peek_next_kind()
+                if next_kind != "embed":
+                    await asyncio.to_thread(rag.ollama.unload_models)
 
         if retry_success:
             _embed_log(f"Retry recuperou {retry_success}/{len(retry_queue)} arquivo(s)")
@@ -360,7 +369,6 @@ def _walk_and_index_sync(
 
 # ─── Worker de background ──────────────────────────────────────────────────────
 
-@with_model_guard(kind="embed")
 async def _batch_embed_worker(project_ids_initial: list, force: bool = False) -> None:
     """Worker assíncrono que roda como background task.
 
@@ -435,9 +443,9 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
 
                 try:
                     # HEARTBEAT: Antes da indexação
-                    _embed_log(f"DEBUG: Iniciando _walk_and_index_sync para {project_id}")
+                    _embed_log(f"DEBUG: Iniciando _walk_and_index_async para {project_id}")
                     stats = await asyncio.wait_for(
-                        asyncio.to_thread(_walk_and_index_sync, project_id, project_root, project_root),
+                        _walk_and_index_async(project_id, project_root, project_root),
                         timeout=3600  # Timeout de 1 hora por projeto
                     )
                     
@@ -555,7 +563,6 @@ async def index_file(path: str) -> str:
 
 
 @mcp_tool_with_logging
-@with_model_guard(kind="embed")
 async def index_directory(path: str, extension: str = None) -> str:
     """Indexa um diretório completo respeitando filtros de extensão e .gitignore.
 
@@ -586,7 +593,7 @@ async def index_directory(path: str, extension: str = None) -> str:
 
     _embed_state["running"] = True
     try:
-        stats = await asyncio.to_thread(_walk_and_index_sync, project_id, abs_path, project_root, extension)
+        stats = await _walk_and_index_async(project_id, abs_path, project_root, extension)
     finally:
         _embed_state["running"] = False
 
