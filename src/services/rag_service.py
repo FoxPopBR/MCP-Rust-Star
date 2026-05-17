@@ -252,7 +252,7 @@ class RAGService:
         except Exception as e:
             logger.error(f"Erro ao ler/indexar arquivo {file_path}: {str(e)}")
             self.update_state(stats_inc={"errors": 1})
-            return f"Erro: {str(e)}"
+            raise
 
     def search_and_generate(self, question: str, project_id: str = None) -> dict:
         """Realiza busca vetorial e gera resposta RAG."""

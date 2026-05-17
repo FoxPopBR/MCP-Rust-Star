@@ -1,3 +1,8 @@
+---
+trigger: model_decision
+description: registros, documentações, leia essa regra para documentar corretamente fatos importantes do projeto corretamente
+---
+
 # Regra 04: Fatiamento Vertical e ADRs
 
 Grandes mudanças devem ser fatiadas e justificadas para manter a velocidade e a qualidade.

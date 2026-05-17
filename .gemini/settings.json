@@ -1,16 +1,8 @@
 {
   "mcpServers": {
-    "rust-star": {
-      "command": "c:/Phantasy/MCP Rust Star/.venv/Scripts/python.exe",
-      "args": [
-        "-m",
-        "src.main"
-      ],
-      "cwd": "c:/Phantasy/MCP Rust Star",
-      "env": {
-        "PYTHONPATH": "c:/Phantasy/MCP Rust Star",
-        "VECTOR_STORE_TYPE": "postgres"
-      }
+    "mcp-rust-star": {
+      "url": "http://127.0.0.1:8765/mcp",
+      "type": "http"
     }
   }
 }

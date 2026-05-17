@@ -1,3 +1,9 @@
+---
+trigger: model_decision
+description: Como a arquitetura do projeto funciona e praticas adotadas, se mantenha no padrão de geração de código do projeto
+globs: A
+---
+
 # Regra 06: Arquitetura Limpa e Separação de Responsabilidades
 
 Para garantir que o MCP Rust Star seja escalável e fácil de manter, seguimos uma arquitetura desacoplada.

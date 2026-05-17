@@ -1,3 +1,8 @@
+---
+trigger: model_decision
+description: Quando precisar saber mais informações sobre como funciona o sistema do projeto.
+---
+
 # Regra 01: Integridade do Sistema e Disciplina Técnica
 
 ## 1. Tratamento de Erros e Diagnósticos
@@ -18,11 +23,12 @@ Seguindo o padrão de elite do Rust Star, o tratamento de erros em Python deve s
 ---
 
 ## 2. Integridade do Protocolo MCP
-O servidor MCP é extremamente sensível à integridade da comunicação via STDIO.
 
-- **Isolamento de Saída**: O `stdout` pertence exclusivamente ao protocolo JSON-RPC. Qualquer caractere extra (como newlines ou mensagens de bibliotecas) causa erro de "EOF while parsing a value".
-- **Redirecionamento Cirúrgico**: Para garantir a estabilidade, todas as ferramentas MCP devem usar o decorador `mcp_tool_with_logging` que implementa `contextlib.redirect_stdout(sys.stderr)`. Isso força qualquer saída acidental para o canal de erro, preservando o canal de dados.
-- **Validação de Retorno**: As ferramentas devem sempre retornar strings amigáveis ou JSON válido.
+O servidor opera em modo **streamable-http** (padrão desde ADR-0015). Nesse modo, o `stdout` NÃO é o canal MCP — o transporte é HTTP via uvicorn na porta configurada em `data/defaults.json`.
+
+- **Modo STDIO (legado)**: se `data/defaults.json` definir `transport: "stdio"`, o `stdout` pertence exclusivamente ao protocolo JSON-RPC. Qualquer caractere extra causa erro de "EOF while parsing a value". Nesse modo, toda saída acidental deve ser redirecionada para `stderr`.
+- **Modo streamable-http (padrão)**: `stdout` é livre; o canal MCP corre em HTTP. O `mcp_tool_with_logging` não precisa de `redirect_stdout`.
+- **Validação de Retorno**: As ferramentas devem sempre retornar strings amigáveis ou JSON válido independente do modo de transporte.
 
 ---
 

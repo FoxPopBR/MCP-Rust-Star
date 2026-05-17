@@ -45,7 +45,7 @@ class OllamaClient:
             logger.critical(f"Falha ao instanciar OllamaClient ({self.base_url}): {str(e)}")
             raise
 
-    def get_embedding(self, text: str, auto_unload: bool = False) -> list:
+    def get_embedding(self, text: str, auto_unload: bool = True) -> list:
         """Gera embedding vetorial para o texto com timeout de 60s e num_ctx fixo."""
         try:
             # timeout em segundos para evitar travamentos

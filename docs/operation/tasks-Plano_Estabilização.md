@@ -33,30 +33,30 @@ Ordem de execução: 3 → 2 → 4 → 1 → 5 → 6
 
 ---
 
-### ⏳ Fase 1 — Transporte HTTP (PENDENTE)
+### ✅ Fase 1 — Transporte HTTP (CONCLUÍDA)
 
-- [ ] Fase 1.1 — Escrever docs/adr/0015-transporte-streamable-http.md (motivação multi-cliente, contraste com STDIO, escopo de Regra 01)
-- [ ] Fase 1.2 — Adicionar seção server (transport/host/port) em data/defaults.json; trocar mcp.run() em src/main.py para streamable-http
-- [ ] Fase 1.3 — Remover _windows_stdin_keepalive; atualizar .agents/rules/01 deixando 'stdout sacro' válido só no modo STDIO legado
-- [ ] Fase 1.4 — Criar scripts/start_server.bat e .ps1; adicionar snippet de config IDE no docs/SESSION_LOG.md
+- [x] Fase 1.1 — Escrever docs/adr/0015-transporte-streamable-http.md (motivação multi-cliente, contraste com STDIO, escopo de Regra 01)
+- [x] Fase 1.2 — Adicionar seção server (transport/host/port) em data/defaults.json; trocar mcp.run() em src/main.py para streamable-http
+- [x] Fase 1.3 — Remover _windows_stdin_keepalive; atualizar .agents/rules/01 deixando 'stdout sacro' válido só no modo STDIO legado
+- [x] Fase 1.4 — Criar scripts/start_server.bat e .ps1; adicionar snippet de config IDE no docs/SESSION_LOG.md
 - [ ] Fase 1.5 — Testar IDE + cliente Python mcp.client.streamable_http simultâneos vendo o mesmo list_projects; atualizar SESSION_LOG
 
 ---
 
-### ⏳ Fase 5 — Lifecycle robusto (PENDENTE)
+### ✅ Fase 5 — Lifecycle robusto (CONCLUÍDA)
 
-- [ ] Fase 5.1 — Escrever docs/adr/0018-lifecycle-graceful-shutdown.md (probes, signal handlers, PID file diagnóstico)
-- [ ] Fase 5.2 — Implementar startup probes (Ollama, PostgreSQL, porta livre) com fail-fast e emissão server.starting/started
-- [ ] Fase 5.3 — Implementar signal handlers SIGTERM/SIGINT: drena ModelGuard (timeout 5s), flush telemetria, unload modelos, emite server.stopped
-- [ ] Fase 5.4 — Adicionar data/server.pid (escrita no startup, remoção no shutdown limpo); criar scripts/stop_server.bat
-- [ ] Fase 5.5 — Testes de lifecycle (subir, derrubar com SIGTERM, validar drenagem); atualizar SESSION_LOG
+- [x] Fase 5.1 — Escrever docs/adr/0018-lifecycle-graceful-shutdown.md (probes, signal handlers, PID file diagnóstico)
+- [x] Fase 5.2 — Implementar startup probes (Ollama, PostgreSQL, porta livre) com fail-fast e emissão server.starting/started
+- [x] Fase 5.3 — Implementar signal handlers SIGTERM/SIGINT: drena ModelGuard (timeout 5s), flush telemetria, unload modelos, emite server.stopped
+- [x] Fase 5.4 — Adicionar data/server.pid (escrita no startup, remoção no shutdown limpo); criar scripts/stop_server.bat
+- [x] Fase 5.5 — 13 testes unitários em tests/services/test_lifecycle.py; todos passando (69 total na suite)
 
 ---
 
-### ⏳ Fase 6 — Superfície de observabilidade HTTP (PENDENTE)
+### ✅ Fase 6 — Superfície de observabilidade HTTP (CONCLUÍDA)
 
-- [ ] Fase 6.1 — Investigar como FastMCP expõe a app ASGI interna para montar rotas Starlette/FastAPI ao lado do /mcp
-- [ ] Fase 6.2 — Implementar GET /health (status, uptime, ollama, db, model_guard, last_event_at)
-- [ ] Fase 6.3 — Implementar GET /events/recent e GET /events/stream (SSE) consumindo o ring buffer do EventBus
-- [ ] Fase 6.4 — Implementar GET /metrics (contadores agregados: total tools, fila depth média, embed throughput)
-- [ ] Fase 6.5 — (Opcional) avaliar migração do dashboard de file-polling para /events/stream; documentar trade-off; fechar SESSION_LOG
+- [x] Fase 6.1 — Investigar como FastMCP expõe a app ASGI interna: `@mcp.custom_route(...)` via `_custom_starlette_routes` (MCP SDK 1.27.1)
+- [x] Fase 6.2 — Implementar GET /health (status, uptime, ollama, db, model_guard, last_event_at)
+- [x] Fase 6.3 — Implementar GET /events/recent (limit/pattern) e GET /events/stream (SSE, poll 0.5s, histórico 60s)
+- [x] Fase 6.4 — Implementar GET /metrics (tool_calls, embed_completed, rag_queries, queue_depth, uptime)
+- [x] Fase 6.5 — (Opcional) avaliar migração do dashboard de file-polling para /events/stream; documentar trade-off — watchfiles já é event-driven (< 250ms); SSE não melhora dashboard local; decisão registrada em ADR-0019 §Fase 6.5

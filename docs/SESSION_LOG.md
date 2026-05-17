@@ -5,6 +5,325 @@ Este documento é o registro mestre de transição entre sessões. Ele detalha o
 
 ---
 
+## 🗓️ Sessão: 17/05/2026 (Parte 12) — Estabilização de Dimensão RAG, Dotenv e Indexação de Nova Rust
+
+### Contexto
+O usuário registrou o novo projeto `"Nova Rust"`, mas a primeira indexação reportou sucesso falso sem carregar a VRAM e sem salvar dados. Um diagnóstico profundo da causa raiz revelou:
+1. Conflito físico de dimensões vetoriais no PostgreSQL: a coluna da tabela era criada como `embedding vector(2560)` fixo, enquanto o modelo `qwen3-embedding:8b` gerava vetores de **4096** dimensões.
+2. Problema de dependência de importação (dotenv): o `load_dotenv` era chamado em `ollama_client.py` após o `PostgresStore` ser importado e inicializado, fazendo a leitura de `EMBEDDING_DIM` falhar e retornar o padrão antigo de 2560.
+3. Ocultação de exceções em `rag_service.py`, que capturava o erro de inserção e retornava uma string, fazendo com que o lote no `main.py` contabilizasse a falha como novo arquivo de sucesso com `0 erros`.
+
+### Conquistas
+
+#### 1. Correção Cirúrgica do Conflito de Dimensões e Dotenv
+- **`src/vector_store_postgres.py`**: Adicionada inicialização dinâmica do tamanho da coluna vetorial com base no `.env` (`embedding vector({self.embedding_dim})`). Importado e chamado `load_dotenv(override=True)` no passo zero absoluto do topo do arquivo, garantindo o ambiente carregado antes de qualquer inicialização de pool.
+- **`run_batch_index.py`**: Adicionado `load_dotenv(override=True)` no topo do script CLI standalone para assegurar dimensões corretas nas execuções de terminal.
+
+#### 2. Propagação Honesta de Exceções no RAG
+- **`src/services/rag_service.py:253`**: Removido o retorno de string de erro silenciosa, inserindo `raise` explícito para propagar exceções reais para o chamador do lote.
+
+#### 3. Parada, Boot HTTP e Recarga de Sessão do Servidor
+- Encerrado o processo antigo travado e subido o novo servidor HTTP MCP saudável na porta 8765 de forma explícita com:
+  `.\.venv\Scripts\python.exe -u -m src.main --transport streamable-http`
+- Forçado o recarregamento do cliente MCP na IDE através de atualização atômica de `mcp_config.json`.
+
+#### 4. Indexação e Validação de 100% de Sucesso do Nova Rust
+- Limpa a tabela corrompida de 2560 dimensões chamando o método de exclusão física do projeto.
+- Disparada a indexação em lote em UTF-8 direto no terminal via script standalone de alta performance.
+- **139 arquivos elegíveis escaneados e indexados** com absoluto sucesso.
+- **0 erros registrados**.
+- Efetuada auditoria física no PostgreSQL do Docker, confirmando a persistência de **151 fragmentos vetoriais de 4096 dimensões** gravados com sucesso na tabela `knowledge_nova_rust`!
+- Modelos descarregados proativamente ao fim para preservar a VRAM do usuário.
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [src/vector_store_postgres.py](../src/vector_store_postgres.py) | `EMBEDDING_DIM` dinâmico + `load_dotenv` no topo. |
+| [src/services/rag_service.py](../src/services/rag_service.py) | Propagação de erro com `raise` no final. |
+| [run_batch_index.py](../run_batch_index.py) | `load_dotenv` no topo + execução robusta CLI. |
+| [mcp_config.json](file:///c:/Users/Foxpop/.gemini/antigravity/mcp_config.json) | Touch do JSON de configuração MCP da IDE. |
+| [task.md](file:///C:/Users/Foxpop/.gemini/antigravity/brain/2395e229-4333-4252-b7bb-6403def37833/task.md) | Criada e mantida a TODO list de execução. |
+| [walkthrough.md](file:///C:/Users/Foxpop/.gemini/antigravity/brain/2395e229-4333-4252-b7bb-6403def37833/walkthrough.md) | Novo walkthrough contendo relatório técnico e evidências de banco. |
+
+### Pendências para Próxima Sessão
+* **Consultas de Validação RAG**: Disparar consultas complexas de RAG sobre o projeto `Nova Rust` para certificar a qualidade da busca vetorial estruturada no Postgres.
+
+---
+
+## 🗓️ Sessão: 17/05/2026 (Parte 11) — Plano de Correção Honesto: Fatia 1 + correções paralelas IDE
+
+### Contexto
+Auditoria das Fases 1/5/6 do Plano de Estabilização v2.0 (Partes 6–10) identificou alterações fora do escopo autorizado e uma regressão prévia no commit `73aa752` (`auto_unload=True → False` em [src/ollama_client.py](../src/ollama_client.py)). Criados o plano-mestre [docs/operation/2026-05-17_Plano_Correcao_Honesto.md](operation/2026-05-17_Plano_Correcao_Honesto.md) e o tasks file [docs/operation/tasks-Plano_Correcao_Honesto.md](operation/tasks-Plano_Correcao_Honesto.md), com 7 fatias finas exigindo **aprovação explícita** entre cada uma.
+
+### Conquistas
+
+#### 1. Fatia 1 concluída — `src/ollama_client.py` (lógica de descarga)
+- [src/ollama_client.py:48](../src/ollama_client.py#L48): default de `get_embedding(auto_unload=...)` restaurado de `False` → `True` (Regra 05 — VRAM Eject Pattern).
+- Grep dos call-sites confirmou que ninguém passa `auto_unload` explicitamente → todos voltam a se beneficiar do descarregamento proativo por padrão.
+- Verificada simetria em `generate_response`, `describe_image`, `unload_models`, `_unload_model` — nenhum análogo sofreu inversão similar.
+- Testes existentes que tocam `OllamaClient` passam sem regressão.
+- Fase 1.6 (aprovação para avançar) marcada `[~]` — encerramento de sessão sem aprovação explícita do usuário.
+
+#### 2. Correções paralelas autorizadas (fora do ciclo de fatias) — diagnóstico de IDE Antigravity travada
+Causa raiz identificada durante a sessão: a IDE Antigravity tentava subir uma 2ª instância STDIO em paralelo ao servidor HTTP rodando no terminal, travando o handshake. Correções aplicadas:
+
+| Arquivo | Mudança | Autorização |
+|---|---|---|
+| [c:\Users\Foxpop\.gemini\antigravity\mcp_config.json](file:///c:/Users/Foxpop/.gemini/antigravity/mcp_config.json) | `mcp-rust-star`: STDIO (`command`/`args`/`cwd`/`env`) → HTTP (`url: http://127.0.0.1:8765/mcp`). `github-mcp-server` mantido intacto. | Explícita do usuário ("sim autorizo") |
+| [.vscode/mcp.json](../.vscode/mcp.json) | Rename `rust-star-knowledge` → `mcp-rust-star`. Mantido HTTP. | Explícita do usuário ("se for util e puder corrigir o nome corrija") |
+
+**Nome canônico ratificado pelo usuário**: `mcp-rust-star` (sobrescreve o nome histórico `rust-star` que estava em HEAD).
+
+#### 3. Atualizações do plano-mestre e tasks file (refletir decisão atual)
+- [docs/operation/2026-05-17_Plano_Correcao_Honesto.md](operation/2026-05-17_Plano_Correcao_Honesto.md):
+  - D5 atualizado: HTTP + nome canônico `mcp-rust-star`.
+  - A6 marcado como resolvido (config Antigravity + `.vscode/mcp.json`).
+  - Fatia 7 atualizada com JSON novo + nota sobre correções paralelas.
+- [docs/operation/tasks-Plano_Correcao_Honesto.md](operation/tasks-Plano_Correcao_Honesto.md):
+  - Fatia 7 com nota sobre nome canônico + correções paralelas.
+  - Fase 7.1 marcada `[x]` (config já estava correta).
+
+### Pendências para próxima sessão
+
+#### Prioridade 1 — aguardando aprovação explícita
+- **Fase 1.6** (`[~]`): aprovação para avançar Fatia 1 → Fatia 2.
+- Validação E2E: usuário precisa recarregar a Antigravity (`Ctrl+Shift+P` → "Developer: Reload Window") e confirmar que o MCP conecta via HTTP sem travar.
+
+#### Prioridade 2 — Fatia 2 (próxima após aprovação)
+`src/services/model_guard.py` — substituir `asyncio.Lock` único por fila com lookahead `peek_next_kind()` + granularidade por chamada (não por batch). Wire-up no `_batch_embed_worker` decidirá `auto_unload` consultando o próximo `kind` aguardando. Testes em [tests/services/test_model_guard.py](../tests/services/test_model_guard.py) precisam cobrir: mesmo kind / outro kind / fila vazia / 5 concorrentes intercalados.
+
+#### Prioridade 3 — Fatias 3–7 (em ordem)
+- **Fatia 3**: restaurar `_windows_stdin_keepalive` em [src/main.py](../src/main.py) com guarda `if _TRANSPORT == "stdio":`.
+- **Fatia 4**: restaurar [.agents/rules/01-mcp-system-integrity.md](../.agents/rules/01-mcp-system-integrity.md) §2 ("stdout sacro").
+- **Fatia 5**: restaurar `SKILL.md` (v1.1) e `CONFIG_GUIDE.md` em [.agents/skills/mcp-rust-star/](../.agents/skills/mcp-rust-star/).
+- **Fatia 6**: editar [docs/adr/0016-model-guard-serializacao-ollama.md](adr/0016-model-guard-serializacao-ollama.md) refletindo causa raiz real (regressão de `auto_unload`) + decisão D1+D2. Verificar pontualmente ADRs 0015/0018/0019.
+- **Fatia 7**: 7.2 (validação E2E rodando servidor + IDE), 7.3 (fechamento neste SESSION_LOG), 7.4 (aprovação final).
+
+### Avisos de segurança
+
+> ⚠️ **Token PAT do GitHub exposto na transcrição**: o token `ghp_[REDACTED]` apareceu em texto plano ao ler [c:\Users\Foxpop\.gemini\antigravity\mcp_config.json](file:///c:/Users/Foxpop/.gemini/antigravity/mcp_config.json) durante o diagnóstico da IDE travada. **Recomendação**: revogar e regenerar em https://github.com/settings/tokens. Considerar mover credenciais para variáveis de ambiente fora do JSON.
+
+### Avisos operacionais
+
+- A IDE Antigravity emitiu warning de schema "A propriedade url não é permitida" para a entrada `mcp-rust-star` no `mcp_config.json` — é apenas warning de schema (a IDE não conhece o formato HTTP do schema oficial MCP). Funcionalmente OK.
+- [scripts/run_server.bat](../scripts/run_server.bat) (e/ou [run_server.bat](../run_server.bat) na raiz) tem texto "Iniciando Servidor MCP (Modo STDIO)" desatualizado — servidor sobe em HTTP por padrão. Bug cosmético, não corrigido (fora do escopo do Plano de Correção Honesto).
+
+### Regras do projeto reforçadas nesta sessão
+- **Regra 00 — Stop & Think**: cada fatia exige autorização explícita antes de iniciar e antes de avançar. Não iniciar Fatia 2 sem confirmação.
+- **Regra 03 — Diagnóstico Científico**: a Fatia 1 partiu do diff real vs HEAD (commit `4cfb30e` pré-regressão vs `73aa752`), não de suposição.
+- **Regra 04 — Vertical Slicing**: 7 fatias finas com validação entre cada uma.
+- **Compromisso técnico**: zero comando git destrutivo (`revert`/`reset`/`checkout --`/`restore .`). Git apenas para `diff`/`show` em leitura.
+
+---
+
+## 🗓️ Sessão: 17/05/2026 (Parte 10) — Transporte CLI/auto-detect, proteção STDIO e shutdown completo
+
+### Contexto
+Continuação direta da Parte 9. Objetivo: suporte robusto a múltiplos modos de transporte (HTTP e STDIO) com detecção automática, proteção de conflito HTTP↔STDIO e garantia de shutdown limpo sem threads residuais.
+
+### Conquistas
+
+#### 1. Auto-detecção de transporte via stdin pipe
+O servidor detecta automaticamente o modo STDIO quando chamado por um IDE via configuração JSON (stdin é pipe, não terminal). Cadeia de prioridade implementada em `src/main.py` `__main__`:
+
+```
+1. --transport <valor>  →  CLI explícito
+2. sys.stdin.isatty() == False  →  stdin é pipe → STDIO automático
+3. data/defaults.json ["server"]["transport"]  →  padrão ("streamable-http")
+```
+
+IDEs como Cursor/VS Code com configuração `"command"` + `"args"` funcionam sem `--transport stdio` explícito.
+
+#### 2. Argparse CLI `--transport`
+`--transport stdio|streamable-http` adicionado ao bloco `__main__` com `argparse`. Permite forçar o modo sem editar `defaults.json`.
+
+#### 3. Proteção STDIO vs HTTP simultâneo (`startup_probes` transport-aware)
+`startup_probes()` agora recebe `transport` e aplica semântica diferente para a probe de porta:
+- HTTP: porta deve estar LIVRE (para o bind do uvicorn).
+- STDIO: porta deve estar LIVRE (se ocupada → servidor HTTP ativo → `sys.exit(1)` com mensagem `CRITICAL`). Evita corrupção do canal stdout do MCP.
+
+#### 4. Signal handler: `sys.exit → os._exit`
+`setup_signal_handlers` trocou `sys.exit(0)` por `os._exit(0)` no handler. `os._exit` mata todas as threads daemon imediatamente e **não** aciona `atexit` — eliminando o risco de dupla execução de `handle_exit`.
+
+#### 5. Guard `_exit_called` contra dupla execução
+`_exit_called = threading.Event()` protege `handle_exit` de rodar duas vezes (atexit + sinal tardio).
+
+#### 6. Join da thread de heartbeat no shutdown
+`handle_exit` sinaliza `_heartbeat_stop` e chama `_heartbeat_thread.join(timeout=3.0)` antes do flush — sem threads residuais após shutdown normal.
+
+#### 7. Scripts atualizados
+- `scripts/start_server.bat`: repassa `%*` para `src.main`, permitindo `--transport`.
+- `scripts/start_server.ps1`: parâmetro `-Transport` tipado com `ValidateSet`, repassado via `@extra`.
+
+### Documentação atualizada
+| Arquivo | Mudança |
+|---|---|
+| `docs/adr/0015-transporte-streamable-http.md` | Seção §Auto-detecção com cadeia de prioridade e proteção STDIO |
+| `docs/adr/0018-lifecycle-graceful-shutdown.md` | `startup_probes` transport-aware, `os._exit`, guard `_exit_called`, join heartbeat |
+| `docs/SESSION_LOG.md` | Esta entrada (Parte 10) |
+| `src/services/lifecycle.py` | `startup_probes(transport)`, `os._exit` no handler |
+| `src/main.py` | argparse, auto-detect, `_exit_called`, join heartbeat |
+| `scripts/start_server.bat` | `%*` forwarding |
+| `scripts/start_server.ps1` | `-Transport` param |
+| `tests/services/test_lifecycle.py` | 2 novos testes STDIO; signal test mockando `os._exit` |
+
+### Pendente
+- **Fase 1.5**: teste de integração IDE + cliente Python simultâneos vendo `list_projects` (requer servidor rodando).
+
+---
+
+## 🗓️ Sessão: 17/05/2026 (Parte 9) — Fase 6.5: Avaliação SSE vs watchfiles
+
+### Contexto
+Fase 6.5 (opcional) do Plano de Estabilização v2.0: avaliar se o dashboard TUI deve migrar de `watchfiles` (file-watching) para consumir `/events/stream` (SSE).
+
+### Conclusão: manter watchfiles, migração não recomendada
+
+O `dashboard/fetcher.py` já opera em modo event-driven via `watchfiles.watch()` — o SO notifica mudanças em `data/dashboard_state.json` sem polling por intervalo fixo. Latência efetiva: < 250ms (throttle do `TelemetryWriter`). Migrar para SSE (poll 500ms) seria **mais lento**, além de exigir reescrita da lógica de state reconstruction no dashboard (snapshot completo → eventos individuais acumulativos) e quebrar suporte ao modo STDIO legado.
+
+`/events/stream` permanece disponível para clientes remotos (dashboard web, CI, monitoramento externo sem acesso ao filesystem do servidor).
+
+### Documentação
+Avaliação detalhada com tabela de trade-offs adicionada em `docs/adr/0019-observabilidade-http.md` §Fase 6.5.
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `docs/adr/0019-observabilidade-http.md` | Seção §Fase 6.5 com tabela de trade-offs e decisão |
+| `docs/operation/tasks-Plano_Estabilização.md` | Fase 6.5 marcada `[x]` — **Plano de Estabilização v2.0 completo** |
+
+### Status do Plano de Estabilização v2.0
+**Todas as fases concluídas**: Fase 3 (EventBus) → Fase 2 (ModelGuard) → Fase 4 (Telemetria) → Fase 1 (HTTP) → Fase 5 (Lifecycle) → Fase 6 (Observabilidade) → Fase 6.5 (Avaliação SSE).
+
+Pendente apenas **Fase 1.5** (teste de integração com servidor rodando: IDE + cliente Python simultâneos vendo `list_projects`).
+
+---
+
+## 🗓️ Sessão: 16/05/2026 (Parte 8) — Fase 6: Observabilidade HTTP (ADR-0019)
+
+### Contexto
+Continuação do Plano de Estabilização v2.0. Fase 6 completa: 4 endpoints HTTP de observabilidade ao lado do `/mcp`, sem porta separada.
+
+### Conquistas
+- **ADR-0019** (`docs/adr/0019-observabilidade-http.md`) — documentado: motivação, decisão, SSE design (poll + ring buffer), alternativas rejeitadas.
+- **`src/services/observability.py`** — Novo módulo com `register_observability_routes`. Usa `@mcp.custom_route(...)` do MCP SDK 1.27.1 (integra via `_custom_starlette_routes` no mesmo uvicorn).
+- **`GET /health`** — status `ok`/`degraded`, uptime, Ollama, DB, ModelGuard, `last_event_at`.
+- **`GET /events/recent`** — query params `limit` (máx 500) e `pattern` (glob); consome ring buffer do EventBus.
+- **`GET /events/stream`** — SSE via `sse-starlette`; envia histórico dos últimos 60s ao conectar, depois poll 0.5s com keepalive 15s.
+- **`GET /metrics`** — `tool_calls_total`, `embed_completed_total`, `rag_queries_total`, `model_guard_queue_depth`, `events_in_buffer`, `uptime_s`.
+- **`src/main.py`** — `_SERVER_START_TIME = time.time()` adicionado; `register_observability_routes(mcp, rag, _bus, _SERVER_START_TIME)` chamado na inicialização.
+- **`tests/services/test_observability.py`** — 9 testes unitários; todos passando.
+
+### Detalhe técnico: integração FastMCP
+`@mcp.custom_route(path, methods)` adiciona uma `starlette.routing.Route` em `FastMCP._custom_starlette_routes`. Na chamada a `mcp.run(transport="streamable-http")`, `streamable_http_app()` faz `routes.extend(self._custom_starlette_routes)` — as rotas ficam no mesmo processo uvicorn, sem porta adicional.
+
+O `get_model_guard` deve ser importado no nível do módulo em `observability.py` (não dentro da função), para que `patch("src.services.observability.get_model_guard")` funcione nos testes.
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `docs/adr/0019-observabilidade-http.md` | Novo — ADR da decisão |
+| `src/services/observability.py` | Novo — 4 endpoints de observabilidade |
+| `src/main.py` | `_SERVER_START_TIME` + `register_observability_routes` |
+| `tests/services/test_observability.py` | Novo — 9 testes unitários |
+| `docs/operation/tasks-Plano_Estabilização.md` | Fase 6 marcada como concluída |
+
+### Resultado dos testes
+**78/78 testes passando** (9 observabilidade + 13 lifecycle + 10 event-driven + 14 EventBus + 10 ModelGuard + 3 live_repaints + 18 state_decider + 1 scratch_sync).
+
+### Próximo passo
+**Fase 6.5 (opcional)**: avaliar migração do dashboard de file-polling para `/events/stream`. Ou iniciar próxima fase do Plano de Estabilização.
+
+---
+
+## 🗓️ Sessão: 16/05/2026 (Parte 7) — Fase 5: Lifecycle Robusto (ADR-0018)
+
+### Contexto
+Continuação do Plano de Estabilização v2.0. Fase 5 completa: startup probes, PID file, ModelGuard drain, signal handlers e 13 testes unitários.
+
+### Conquistas
+- **ADR-0018** (`docs/adr/0018-lifecycle-graceful-shutdown.md`) — documentado: motivação (startup cego, shutdown abrupto, sem rastreabilidade de processo), decisão e catálogo de eventos.
+- **`src/services/lifecycle.py`** — Novo módulo com `write_pid_file`, `remove_pid_file`, `_check_port_free` (connect-based, contornando `SO_REUSEADDR` do Windows), `startup_probes`, `drain_model_guard`, `setup_signal_handlers`.
+- **`src/main.py`** — `handle_exit()` ampliado com `server.stopped` emit, `drain_model_guard()`, flush de telemetria e `remove_pid_file()`. Bloco `__main__` adiciona `setup_signal_handlers`, `startup_probes` e `write_pid_file` antes de `mcp.run()`.
+- **`scripts/stop_server.bat`** — Novo script que lê `data/server.pid` e encerra com `taskkill /PID`.
+- **`tests/services/test_lifecycle.py`** — 13 testes unitários: PID file, port probe, startup probes (3 cenários de falha), drain (3 cenários), signal handler. Todos passando.
+
+### Detalhe técnico: `SO_REUSEADDR` no Windows
+No Windows, `SO_REUSEADDR` permite que dois sockets se liguem ao mesmo endereço/porta simultaneamente — diferente do comportamento Unix. Detectar "porta em uso" via `bind()` falha silenciosamente. Solução: `connect_ex()` ao host/porta alvo; retorna 0 apenas se houver um servidor escutando.
+
+O patch dos testes de `drain_model_guard` deve apontar para `src.services.model_guard.get_model_guard` (módulo-fonte), pois a importação ocorre dentro do corpo da função, não no nível do módulo `lifecycle`.
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `docs/adr/0018-lifecycle-graceful-shutdown.md` | Novo — ADR da decisão |
+| `src/services/lifecycle.py` | Novo — módulo de lifecycle |
+| `src/main.py` | `handle_exit` + `__main__` integrados ao lifecycle |
+| `scripts/stop_server.bat` | Novo — stop via PID file |
+| `tests/services/test_lifecycle.py` | Novo — 13 testes unitários |
+| `docs/operation/tasks-Plano_Estabilização.md` | Fase 5 marcada como concluída |
+
+### Resultado dos testes
+**69/69 testes passando** (13 lifecycle + 10 event-driven + 14 EventBus + 10 ModelGuard + 3 live_repaints + 18 state_decider + 1 scratch_sync).
+
+### Próximo passo
+**Fase 6 — Superfície de observabilidade HTTP**: `/health`, `/events/recent`, `/events/stream` SSE endpoints ao lado do `/mcp`.
+
+---
+
+## 🗓️ Sessão: 16/05/2026 (Parte 6) — Fase 1: Transporte Streamable-HTTP (ADR-0015)
+
+### Contexto
+Continuação do Plano de Estabilização v2.0. Fase 1 completa: servidor migrado de STDIO para streamable-http, `_windows_stdin_keepalive` removido, scripts de start criados.
+
+### Conquistas
+- **ADR-0015** (`docs/adr/0015-transporte-streamable-http.md`) — documentado: motivação multi-cliente, contraste com STDIO, decisão de usar streamable-http nativo do FastMCP 1.27+.
+- **`data/defaults.json`** — criado com seção `server` (`transport`, `host`, `port`). FastMCP lê `host`/`port` via construtor; `transport` passado no `mcp.run()`.
+- **`src/main.py`** — `_windows_stdin_keepalive()` removido; bloco `asyncio.get_event_loop()` removido; `mcp.run()` → `mcp.run(transport=_TRANSPORT)`; FastMCP inicializado com `host=_HOST, port=_PORT` lidos de `defaults.json`.
+- **`.agents/rules/01`** — Seção 2 atualizada: "stdout sacro" restrito ao modo STDIO legado; streamable-http (padrão) não tem essa restrição.
+- **`scripts/start_server.bat`** e **`scripts/start_server.ps1`** — criados para iniciar o servidor com as variáveis de ambiente corretas.
+
+### Configuração de cliente (snippet IDE)
+
+**Antes (STDIO — legado):**
+```json
+{
+  "rust-star-knowledge": {
+    "command": "c:/Phantasy/MCP Rust Star/.venv/Scripts/python.exe",
+    "args": ["-m", "src.main"],
+    "cwd": "c:/Phantasy/MCP Rust Star",
+    "env": { "PYTHONPATH": "c:/Phantasy/MCP Rust Star", "VECTOR_STORE_TYPE": "postgres" }
+  }
+}
+```
+
+**Depois (streamable-http — padrão):**
+```json
+{
+  "rust-star-knowledge": {
+    "url": "http://127.0.0.1:8765/mcp"
+  }
+}
+```
+
+### Arquivos alterados
+| Arquivo | Mudança |
+|---|---|
+| `docs/adr/0015-transporte-streamable-http.md` | Novo — ADR da decisão |
+| `data/defaults.json` | Novo — seção server com transport/host/port |
+| `src/main.py` | `_windows_stdin_keepalive` removido; `mcp.run(transport=_TRANSPORT)` |
+| `.agents/rules/01-mcp-system-integrity.md` | §2 atualizado para modo HTTP vs STDIO |
+| `scripts/start_server.bat` | Novo — script de start Windows CMD |
+| `scripts/start_server.ps1` | Novo — script de start PowerShell |
+
+### Resultado dos testes
+**55/55 testes passando** (sem regressões).
+
+### Próximo passo
+**Fase 5 — Lifecycle robusto**: ADR-0018, startup probes (Ollama, PostgreSQL), signal handlers SIGTERM/SIGINT, `data/server.pid`.
+
+---
+
 ## 🗓️ Sessão: 16/05/2026 (Parte 5) — Fase 4: Telemetria via EventBus (ADR-0014)
 
 ### Contexto

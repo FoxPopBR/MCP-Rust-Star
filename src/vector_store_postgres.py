@@ -4,6 +4,9 @@ from pgvector.psycopg2 import register_vector
 import os
 import json
 import re
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 from collections import Counter
 from tools.logger import logger
 
@@ -14,6 +17,7 @@ class PostgresStore:
         self.db_name = os.getenv("POSTGRES_DB", "mcp_knowledge")
         self.user = os.getenv("POSTGRES_USER", "user")
         self.password = os.getenv("POSTGRES_PASSWORD", "password")
+        self.embedding_dim = int(os.getenv("EMBEDDING_DIM", "2560"))
         self._pool = None
         self._init_db()
 
@@ -93,7 +97,7 @@ class PostgresStore:
                     CREATE TABLE IF NOT EXISTS {table_name} (
                         id UUID PRIMARY KEY,
                         content TEXT NOT NULL,
-                        embedding vector(2560),
+                        embedding vector({self.embedding_dim}),
                         metadata JSONB,
                         category TEXT,
                         tags JSONB,

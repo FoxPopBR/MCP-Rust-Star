@@ -1,3 +1,8 @@
+---
+trigger: model_decision
+description: Para saber mais sobre Performance RAG e Enriquecimento de Dados
+---
+
 # Regra 05: Performance RAG e Enriquecimento de Dados
 
 A qualidade das respostas do assistente depende diretamente da precisão da recuperação (Retrieval) e da performance do pipeline de dados.

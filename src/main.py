@@ -22,6 +22,7 @@ import datetime
 import os
 import sys
 import json
+import time
 from collections import Counter
 from functools import wraps
 import threading
@@ -31,15 +32,29 @@ from src.services.rag_service import RAGService
 from src.services.telemetry_writer import TelemetryWriter, InventoryProvider
 from src.services.event_bus import get_event_bus
 from src.services.model_guard import with_model_guard, get_model_guard
+from src.services.observability import register_observability_routes
 from tools.logger import logger
 
 # ─── Inicialização do servidor ─────────────────────────────────────────────────
 
-mcp = FastMCP("Rust Star Knowledge Server")
-rag = RAGService()
-
 os.makedirs("data", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
+
+_defaults_path = os.path.join("data", "defaults.json")
+_defaults: dict = {}
+if os.path.exists(_defaults_path):
+    with open(_defaults_path, encoding="utf-8") as _f:
+        _defaults = json.load(_f)
+
+_srv = _defaults.get("server", {})
+_HOST = _srv.get("host", "127.0.0.1")
+_PORT = int(_srv.get("port", 8765))
+_TRANSPORT = _srv.get("transport", "streamable-http")
+
+_SERVER_START_TIME = time.time()
+
+mcp = FastMCP("Rust Star Knowledge Server", host=_HOST, port=_PORT)
+rag = RAGService()
 
 PROJECTS_FILE = "data/projects.json"
 BATCH_PROGRESS_FILE = "data/batch_progress.json"
@@ -58,6 +73,8 @@ _telemetry = TelemetryWriter(
 )
 
 rag._on_state_change = lambda: _bus.emit("rag.state.changed", {})
+
+register_observability_routes(mcp, rag, _bus, _SERVER_START_TIME)
 
 
 # ─── Helpers de projetos ───────────────────────────────────────────────────────
@@ -1264,32 +1281,80 @@ async def clear_knowledge_base(project_id: str = None) -> str:
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
 _heartbeat_stop = threading.Event()
+_heartbeat_thread: threading.Thread | None = None  # atribuído em __main__
+_exit_called = threading.Event()
+
 
 def handle_exit():
-    """Libera recursos ao encerrar o servidor."""
-    logger.info("Encerrando MCP Rust Star Knowledge Server. Liberando VRAM...")
+    """Libera recursos ao encerrar o servidor (atexit + signal handlers).
+
+    Protegido por _exit_called para execução única — evita chamada dupla quando
+    o signal handler dispara sys.exit() que por sua vez aciona atexit.
+    """
+    if _exit_called.is_set():
+        return
+    _exit_called.set()
+
+    from src.services.lifecycle import drain_model_guard, remove_pid_file
+    logger.info("Encerrando MCP Rust Star Knowledge Server...")
+    _bus.emit("server.stopped", {})
+    drain_model_guard()
     _heartbeat_stop.set()
+    if _heartbeat_thread is not None and _heartbeat_thread.is_alive():
+        _heartbeat_thread.join(timeout=3.0)
+    try:
+        payload = _telemetry.snapshot(
+            embed_state=_embed_state,
+            rag_state=rag.state,
+            batch_progress=_batch_progress_cache,
+            server_extra=_server_extra,
+        )
+        _telemetry.flush(payload)
+    except Exception:
+        pass
     rag.ollama.unload_models()
-
-
-async def _windows_stdin_keepalive():
-    """Previne o deadlock do ProactorEventLoop ocioso no Windows com stdin."""
-    while True:
-        await asyncio.sleep(0.5)
+    remove_pid_file()
+    logger.info("Encerrando MCP Rust Star Knowledge Server. Liberando VRAM... OK")
 
 
 if __name__ == "__main__":
+    import argparse
     import atexit
+    from src.services.lifecycle import startup_probes, setup_signal_handlers, write_pid_file
+
+    # ── CLI: --transport pode sobrescrever o valor de defaults.json ──────────────
+    _parser = argparse.ArgumentParser(
+        description="MCP Rust Star Knowledge Server",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    _parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default=None,
+        help=(
+            "Modo de transporte MCP.\n"
+            "  streamable-http  Servidor HTTP em %(default)s (padrão de defaults.json)\n"
+            "  stdio            Canal stdin/stdout (modo legado/IDE)\n"
+            "Se omitido, usa o valor de data/defaults.json (padrão: streamable-http)."
+        ),
+    )
+    _args = _parser.parse_args()
+    if _args.transport is not None:
+        # Argumento explícito na linha de comando tem prioridade máxima
+        _TRANSPORT = _args.transport
+    elif not sys.stdin.isatty():
+        # stdin é um pipe → chamado pelo IDE via config JSON → STDIO automático
+        _TRANSPORT = "stdio"
+    # else: terminal interativo → mantém o valor de defaults.json (streamable-http)
+
     atexit.register(handle_exit)
-    
-    # Injeta a task de keepalive no event loop antes do MCP rodar
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    loop.create_task(_windows_stdin_keepalive())
+    setup_signal_handlers(handle_exit)
+
+    # Probes: falha rápida se Ollama, PostgreSQL ou porta estiverem indisponíveis.
+    # Para STDIO: também verifica se o servidor HTTP está ativo (proteção de modo).
+    startup_probes(rag, _bus, _HOST, _PORT, transport=_TRANSPORT)
+
+    write_pid_file()
 
     # Inicia thread de heartbeat (10s) para manter dashboard atualizado e detectar crash
     _heartbeat_thread = threading.Thread(
@@ -1298,6 +1363,6 @@ if __name__ == "__main__":
         daemon=True
     )
     _heartbeat_thread.start()
-    
-    logger.info("=== MCP RUST STAR KNOWLEDGE SERVER INICIADO ===")
-    mcp.run()
+
+    logger.info(f"=== MCP RUST STAR KNOWLEDGE SERVER PRONTO [{_TRANSPORT.upper()} {_HOST}:{_PORT}] ===")
+    mcp.run(transport=_TRANSPORT)
