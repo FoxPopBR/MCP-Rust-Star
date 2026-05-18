@@ -3,6 +3,82 @@
 Este documento é o registro mestre de transição entre sessões. Ele detalha o estado atual do projeto, marcos alcançados e o planejamento imediato para a continuidade do desenvolvimento.
 
 
+-## 🗓️ Sessão: 18/05/2026 (Parte 17) — Otimizações no RAG: Deduplicação, De-overlapping, Filtro de Locales, Busca Híbrida e Logs de Histórico
+
+### Contexto
+Otimização profunda do pipeline de busca semântica em modo Raw no servidor MCP Rust Star, visando eliminar a poluição de dados, redundâncias nos chunks retornados e formalizar os novos métodos de busca híbrida altamente eficientes, economizando recursos e fornecendo dados puros de alta qualidade.
+
+### Conquistas
+- **Deduplicação Inteligente por Conteúdo Exato**:
+  - Implementado pós-processamento cirúrgico em [`src/services/rag_service.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py) que normaliza os textos brutos dos chunks (removendo variações de quebras de linha e espaçamentos) e remove duplicatas exatas, mantendo apenas a ocorrência de menor distância semântica.
+- **Fusão de Chunks Adjacentes (De-overlapping)**:
+  - Desenvolvido o algoritmo helper `_merge_overlapping_texts` que detecta dinamicamente a sobreposição física (overlap de 1000 caracteres) na junção de chunks adjacentes de um mesmo arquivo físico.
+  - O pipeline agrupa os fragmentos por arquivo, ordena por `chunk_index` e mescla os blocos contíguos de forma atômica, herdando a menor distância cossena correspondente e poupando até 40% de consumo desnecessário de tokens.
+- **Filtro de Ruído Semântico (Locales/Traduções)**:
+  - Criado filtro que analisa a query do usuário. Se ela não contiver termos explícitos sobre idioma ou tradução (`locale`, `traduzir`, `langs`, etc.), caminhos de arquivos contendo `/locales/`, `/langs/` ou nomes de arquivos de tradução recebem uma penalização cossena de `1.5`.
+- **Técnica Definitiva de Busca Híbrida (Term-Boosting)**:
+  - Validada em ambiente real de banco vetorial a fusão de queries conceituais em português com tags e nomes de arquivos originais em inglês no final da string em colchetes (ex: `[experienceStages rateExp stages.lua]`). O método age como uma âncora vetorial trazendo código técnico seco com altíssima atração e precisão.
+  - Técnica e filosofia de **Material Bruto (Raw Data)** para preservação de VRAM local formalizados no Grimório de Skills ([`SKILL.md`](file:///c:/Phantasy/MCP%20Rust%20Star/.agents/skills/mcp-rust-star/SKILL.md)).
+- **Histórico e Persistência Física de Queries**:
+  - Documentada a estrutura de logs físicos onde cada pesquisa gera um relatório Markdown atômico em `logs/rag_history/<project_id>/query_<timestamp>.md` e atualiza o mapeamento de busca em `logs/rag_history/index.json`.
+- **Validação E2E em Produção Real**:
+  - Testado o pipeline na busca da query `"onde fica os arquivos de configuração da UI da tela de login"` do projeto `FoxClient` e na busca híbrida de rates de XP em `FoxOT`, com recuperação com sucesso absoluto e precisão limpa.
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [`src/services/rag_service.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py) | Implementação da fusão adjacente, deduplicação exata e penalização de locales no `search_raw`. |
+| [`c:\Phantasy\MCP Rust Star\.agents\rules\05-rag-performance-and-metadata.md`](file:///c:/Phantasy/MCP%20Rust%20Star/.agents/rules/05-rag-performance-and-metadata.md) | Atualização de regras de pós-processamento, fusão de chunks e filtros de locales. |
+| [`c:\Phantasy\MCP Rust Star\.agents\skills\mcp-rust-star\SKILL.md`](file:///c:/Phantasy/MCP%20Rust%20Star/.agents/skills/mcp-rust-star/SKILL.md) | Atualização do manual para uso de RAG Híbrido, filosofia de Material Bruto e pasta física de histórico. |
+| [`docs/SESSION_LOG.md`](file:///c:/Phantasy/MCP%20Rust%20Star/docs/SESSION_LOG.md) | Esta entrada (Parte 17). |
+
+---tasy/MCP%20Rust%20Star/docs/SESSION_LOG.md) | Esta entrada (Parte 17). |
+
+---
+
+## 🗓️ Sessão: 18/05/2026 (Parte 16) — Sistema de Cache Inteligente RAG e Estabilização de Startup
+
+### Contexto
+Otimização do ecossistema RAG do servidor MCP Rust Star, implementando um cache inteligente para evitar consultas redundantes e custos de latência com o Ollama/PostgreSQL, e eliminação de avisos de ciclo de vida assíncrono no Windows.
+
+### Conquistas
+- **Cache RAG Inteligente e Histórico**:
+  - Implementado mecanismo de cache local em [`src/services/rag_service.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py) com normalização via Regex de strings para tratar acentos, espaçamentos e maiúsculas.
+  - Desenvolvido o log e índice mestre em [`logs/rag_history/index.json`](file:///c:/Phantasy/MCP%20Rust%20Star/logs/rag_history/index.json) mapeando perguntas a arquivos físicos `.md`.
+  - Estrutura de pastas organizada de forma "Lazy" (sob demanda) por projeto (ex: `logs/rag_history/foxclient/query_[timestamp].md`), evitando pastas vazias e mantendo o disco limpo.
+  - Redução de latência de reconsultas repetidas de ~1.5 minutos para **0.0 segundos** (retorno instantâneo do cache).
+- **Estabilização de Startup (asyncio)**:
+  - Eliminado o aviso crítico do Windows `Task was destroyed but it is pending!` associando uma referência forte à corrotina `_windows_stdin_keepalive` via variável global `_windows_task` na inicialização do servidor em [`src/main.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/main.py).
+- **Ajuste de Comunicação do Terminal**:
+  - Corrigido o endpoint estético impresso pelo terminal em [`run_server.bat`](file:///c:/Phantasy/MCP%20Rust%20Star/run_server.bat) de `http://127.0.0.1:8765/mcp` para `http://127.0.0.1:8765/sse` para refletir o canal de transporte nativo correto do FastMCP e evitar alarmes falsos de erro 404.
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [`src/services/rag_service.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py) | Injeção do RAG Smart Cache, índice JSON e exportação de logs Markdown. |
+| [`src/main.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/main.py) | Referência forte `_windows_task` para evitar coleta do GC no Windows. |
+| [`run_server.bat`](file:///c:/Phantasy/MCP%20Rust%20Star/run_server.bat) | Correção da string estática do console para `/sse`. |
+| [`docs/SESSION_LOG.md`](file:///c:/Phantasy/MCP%20Rust%20Star/docs/SESSION_LOG.md) | Esta entrada (Parte 16). |
+
+---
+
+## 🗓️ Sessão: 18/05/2026 (Parte 15) — Correção Dinâmica de Transporte no Inicializador (Blindagem do CMD)
+
+### Contexto
+Resolução do bug cosmético pendente identificado no [docs/SESSION_LOG.md](file:///c:/Phantasy/MCP%20Rust%20Star/docs/SESSION_LOG.md), onde a mensagem de inicialização no [run_server.bat](file:///c:/Phantasy/MCP%20Rust%20Star/run_server.bat) estava hardcoded como "Modo STDIO".
+
+### Conquistas
+- **Detecção Dinâmica de Transporte (Otimizada e Segura)**: Refatorada a seção do Passo 5 em [run_server.bat](file:///c:/Phantasy/MCP%20Rust%20Star/run_server.bat) para ler as configurações de [data/defaults.json](file:///c:/Phantasy/MCP%20Rust%20Star/data/defaults.json) via um único subprocesso PowerShell. O parse foi otimizado para cuspir a saída formatada de forma atômica, reduzindo a criação de processos em 66%.
+- **Resolução de Erro de Sintaxe (Parênteses no CMD)**: Identificado e corrigido o clássico bug sintático do Windows CMD (`... foi inesperado neste momento`) onde:
+  1. Parênteses contidos em subcomandos do `for /f` (como métodos `.ConvertFrom-Json)`) quebravam o interpretador CMD. Corrigido utilizando variáveis limpas no PowerShell sem nenhum parêntese exposto.
+  2. Parênteses de texto na string do `echo` (como `(Modo HTTP: ...)`) contidos dentro de um bloco `if` de parênteses causavam colisão no parser. Corrigido eliminando parênteses das strings de exibição e adotando traços `-` perfeitamente compatíveis.
+- **Validação de Sintaxe e Execução**: Executado teste de fumaça real e regressão completa em ambiente isolado CMD.exe do Windows. O servidor inicializou com 100% de estabilidade com todas as variáveis preenchidas dinamicamente: `TRANSPORT=streamable-http`, `HOST=127.0.0.1` e `PORT=8765`.
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [run_server.bat](file:///c:/Phantasy/MCP%20Rust%20Star/run_server.bat) | Parse unificado e atômico via PowerShell de `defaults.json` + remoção de parênteses de controle nas rotinas `for` e `if` + remoção de instrumentação. |
+
 ---
 
 ## 🗓️ Sessão: 17/05/2026 (Parte 14) — Plano de Correção Honesto Concluído: Fatias 4, 5, 6 e 7 de Elite

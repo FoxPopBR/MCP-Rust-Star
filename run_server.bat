@@ -190,9 +190,18 @@ if !ERRORLEVEL! neq 0 (
 ) else (
     echo    [OK] Bibliotecas validadas. >&2
 )
-
 :: ── PASSO 5: Inicia servidor ──────────────────────────────────────────────────
-echo [5/5] Iniciando Servidor MCP (Modo STDIO)... >&2
+set "TRANSPORT=streamable-http"
+set "HOST=127.0.0.1"
+set "PORT=8765"
+
+for /f "usebackq tokens=*" %%a in (`powershell -NoProfile -Command "$cfg = Get-Content -Raw '%PROJECT_ROOT%data\defaults.json' | ConvertFrom-Json; $t = $cfg.server.transport; $h = $cfg.server.host; $p = $cfg.server.port; 'TRANSPORT=' + $t; 'HOST=' + $h; 'PORT=' + $p" 2^>nul`) do set "%%a"
+
+if "!TRANSPORT!"=="streamable-http" (
+    echo [5/5] Iniciando Servidor MCP - Modo HTTP: http://!HOST!:!PORT!/sse... >&2
+) else (
+    echo [5/5] Iniciando Servidor MCP - Modo STDIO... >&2
+)
 echo [5/5] Iniciando servidor >> "%START_LOG%"
 echo ---------------------------------------------------------- >&2
 echo [INFO] Log do servidor: %MCP_LOG% >&2

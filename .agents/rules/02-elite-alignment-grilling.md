@@ -1,3 +1,7 @@
+---
+trigger: model_decision
+---
+
 # Regra 02: Protocolo de Alinhamento "Grilling" (Sabatina)
 
 Antes de escrever qualquer código ou aplicar mudanças arquiteturais, o agente DEVE passar pela fase de alinhamento para evitar "vibe coding".

@@ -1,6 +1,9 @@
 import os
 import uuid
 import hashlib
+import json
+import datetime
+import re
 from typing import List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -33,9 +36,132 @@ class RAGService:
         settings = self.config.get_all().get("indexing", {})
         self.chunk_size = settings.get("chunk_size", int(os.getenv("CHUNK_SIZE", "8000")))
         self.chunk_overlap = settings.get("chunk_overlap", int(os.getenv("CHUNK_OVERLAP", "1000")))
+        # Configuração de busca RAG
+        rag_settings = self.config.get_all().get("rag", {})
+        self.distance_threshold = rag_settings.get("distance_threshold", 0.75)
+        self.n_results = rag_settings.get("n_results", 5)
+        # Diretórios de Cache e Histórico
+        self.history_dir = os.path.join("logs", "rag_history")
+        self.index_file = os.path.join(self.history_dir, "index.json")
+        os.makedirs(self.history_dir, exist_ok=True)
         
         logger.info(f"RAGService inicializado | Store: {self.store_type.upper()} | Chunk: {self.chunk_size} chars / Overlap: {self.chunk_overlap} chars")
         self._persist_state()
+
+    def _normalize_question(self, question: str) -> str:
+        """Normaliza a pergunta para uso como chave no cache."""
+        q = question.lower().strip()
+        q = re.sub(r'[^\w\s]', '', q)
+        q = re.sub(r'\s+', ' ', q)
+        return q
+
+    def _get_cache_index(self) -> dict:
+        """Carrega o índice mestre de cache."""
+        if not os.path.exists(self.index_file):
+            return {}
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Erro ao ler cache index: {e}")
+            return {}
+
+    def _save_cache_index(self, index_data: dict):
+        """Salva o índice mestre de cache."""
+        try:
+            with open(self.index_file, "w", encoding="utf-8") as f:
+                json.dump(index_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Erro ao salvar cache index: {e}")
+
+    def _check_cache(self, question: str, project_id: str = None) -> dict:
+        """Verifica se a pergunta já foi respondida recentemente."""
+        folder = project_id if project_id else "global"
+        norm_q = self._normalize_question(question)
+        if not norm_q: return None
+        
+        index_data = self._get_cache_index()
+        if folder in index_data and norm_q in index_data[folder]:
+            cache_entry = index_data[folder][norm_q]
+            file_path = cache_entry.get("file_path")
+            
+            if file_path and os.path.exists(file_path):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        
+                    # Extrai a resposta usando regex ou split
+                    answer_match = re.search(r"## 🤖 Resposta Gerada\s+(.*?)\s+## 📚 Fontes e Contexto", content, re.DOTALL)
+                    if answer_match:
+                        logger.info(f"⚡ [CACHE HIT] Resposta recuperada instantaneamente para: {norm_q}")
+                        return {
+                            "answer": answer_match.group(1).strip() + "\n\n*(Resposta instantânea carregada do cache local)*",
+                            "sources": [{"info": f"Veja o log completo em {file_path}"}],
+                            "project_id": project_id,
+                            "cached": True
+                        }
+                except Exception as e:
+                    logger.error(f"Erro ao ler arquivo de cache {file_path}: {e}")
+        return None
+
+    def _log_and_cache(self, question: str, answer: str, sources: list, project_id: str = None):
+        """Salva a consulta em um arquivo Markdown e atualiza o index.json."""
+        try:
+            folder = project_id if project_id else "global"
+            target_dir = os.path.join(self.history_dir, folder)
+            os.makedirs(target_dir, exist_ok=True)
+            
+            timestamp = datetime.datetime.now()
+            ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+            ts_display = timestamp.strftime("%d/%m/%Y %H:%M:%S")
+            
+            file_name = f"query_{ts_str}.md"
+            file_path = os.path.join(target_dir, file_name)
+            
+            # Monta o Markdown
+            md_lines = [
+                f"# Consulta RAG: {folder} ({ts_display})",
+                "",
+                "## ❓ Pergunta",
+                f"> {question}",
+                "",
+                "## 🤖 Resposta Gerada",
+                answer,
+                "",
+                "## 📚 Fontes e Contexto Utilizados",
+                "| Arquivo Fonte | Categoria | Chunk / Total | Tags |",
+                "|---|---|---|---|"
+            ]
+            
+            for s in sources:
+                if isinstance(s, dict):
+                    source_path = s.get("source", "N/A")
+                    category = s.get("category", "N/A")
+                    chunk_idx = s.get("chunk_index", 0)
+                    total_chunks = s.get("total_chunks", 0)
+                    tags = ", ".join(s.get("tags", []))
+                    md_lines.append(f"| `{source_path}` | {category} | {chunk_idx} / {total_chunks} | [{tags}] |")
+                else:
+                    md_lines.append(f"| {str(s)} | | | |")
+                    
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(md_lines))
+                
+            # Atualiza Cache Index
+            norm_q = self._normalize_question(question)
+            if norm_q:
+                index_data = self._get_cache_index()
+                if folder not in index_data:
+                    index_data[folder] = {}
+                index_data[folder][norm_q] = {
+                    "file_path": file_path.replace("\\", "/"),
+                    "timestamp": ts_display,
+                    "question_raw": question
+                }
+                self._save_cache_index(index_data)
+                
+        except Exception as e:
+            logger.error(f"Erro ao salvar log/cache do RAG: {e}")
 
     def _persist_state(self):
         """Notifica o observador (telemetry writer) com o estado atual.
@@ -257,6 +383,11 @@ class RAGService:
     def search_and_generate(self, question: str, project_id: str = None) -> dict:
         """Realiza busca vetorial e gera resposta RAG."""
         try:
+            # 0. Verifica o Cache Instantâneo
+            cached = self._check_cache(question, project_id)
+            if cached:
+                return cached
+
             # 1. Gera embedding da pergunta
             question_embedding = self.ollama.get_embedding(question, auto_unload=False)
 
@@ -278,17 +409,425 @@ class RAGService:
             # 4. Gera resposta
             answer = self.ollama.generate_response(question, context_str, project_id=project_id)
 
+            # 5. Salva o Log e atualiza o Cache
+            self._log_and_cache(question, answer, sources, project_id)
+
             return {"answer": answer, "sources": sources}
         except Exception as e:
             logger.error(f"Erro no fluxo RAG: {str(e)}")
             return {"answer": f"Erro: {str(e)}", "sources": []}
 
+    def search_project_isolated(self, question: str, project_id: str) -> dict:
+        """Busca isolada em um único projeto. Rápida e precisa.
+        Uso: quando o projeto é conhecido. Gera embedding e busca apenas naquela tabela.
+        """
+        try:
+            cached = self._check_cache(question, project_id)
+            if cached:
+                return cached
+
+            logger.info(f"Busca isolada | Projeto: {project_id} | Pergunta: {question[:80]}")
+            question_embedding = self.ollama.get_embedding(question, auto_unload=False)
+            results = self.db.search(question_embedding, project_id=project_id, n_results=5)
+            if not results:
+                return {"answer": "Nenhum contexto encontrado neste projeto.", "sources": [], "project_id": project_id}
+            context_str = "\n\n".join(r["content"] for r in results)
+            answer = self.ollama.generate_response(question, context_str, project_id=project_id)
+            
+            sources = [r["metadata"] for r in results]
+            self._log_and_cache(question, answer, sources, project_id)
+            
+            return {"answer": answer, "sources": sources, "project_id": project_id}
+        except Exception as e:
+            logger.error(f"Erro na busca isolada [{project_id}]: {str(e)}")
+            return {"answer": f"Erro: {str(e)}", "sources": [], "project_id": project_id}
+
+    def search_all_projects_sequential(self, question: str) -> dict:
+        """Busca em todos os projetos sequencialmente.
+        ⚠️ Lenta: percorre todas as tabelas rag_* uma a uma.
+        Uso: quando não se sabe em qual projeto está a informação.
+        """
+        try:
+            cached = self._check_cache(question, "global")
+            if cached:
+                return cached
+                
+
+            logger.info(f"Busca global (todos projetos) | Pergunta: {question[:80]}")
+            question_embedding = self.ollama.get_embedding(question, auto_unload=False)
+            all_tables = self.db._get_all_tables()
+            results_by_project = {}
+            for table in all_tables:
+                project_name = table[4:]  # remove prefixo "rag_"
+                results = self.db.search(question_embedding, project_id=project_name, n_results=3)
+                if results:
+                    results_by_project[project_name] = results
+
+            if not results_by_project:
+                return {"answer": "Nenhum contexto encontrado em nenhum projeto.", "sources": [], "projects_searched": all_tables}
+
+            # Combina todos os resultados para gerar uma resposta unificada
+            context_parts = []
+            all_sources = []
+            for proj, docs in results_by_project.items():
+                context_parts.append(f"[Projeto: {proj}]")
+                for d in docs:
+                    context_parts.append(d["content"])
+                    all_sources.append(d["metadata"])
+
+            context_str = "\n\n".join(context_parts)
+            answer = self.ollama.generate_response(question, context_str)
+            
+            self._log_and_cache(question, answer, all_sources, "global")
+            
+            return {"answer": answer, "sources": all_sources, "projects_searched": list(results_by_project.keys())}
+        except Exception as e:
+            logger.error(f"Erro na busca global: {str(e)}")
+            return {"answer": f"Erro: {str(e)}", "sources": [], "projects_searched": []}
+
+    def cross_project_analysis(self, searches: list, analysis_prompt: str) -> dict:
+        """Busca sequencial em múltiplos projetos e análise cruzada dos resultados.
+
+        Args:
+            searches: Lista de {"project_id": str, "query": str}
+            analysis_prompt: O que analisar com os dados coletados de todos os projetos.
+
+        Processa uma busca de cada vez (fila síncrona) para não sobrecarregar o Ollama,
+        depois combina tudo e gera análise unificada.
+        """
+        try:
+            logger.info(f"Análise cruzada | {len(searches)} projeto(s) | Prompt: {analysis_prompt[:80]}")
+            collected = {}
+
+            # Fila sequencial: um embedding por vez
+            for search in searches:
+                project_id = search.get("project_id", "")
+                query = search.get("query", "")
+                if not project_id or not query:
+                    logger.warning(f"Busca inválida ignorada: {search}")
+                    continue
+                logger.info(f"  > Buscando em '{project_id}': {query[:60]}")
+                embedding = self.ollama.get_embedding(query, auto_unload=False)
+                results = self.db.search(embedding, project_id=project_id, n_results=5)
+                collected[project_id] = {"query": query, "results": results}
+
+            if not collected:
+                return {"analysis": "Nenhum resultado coletado.", "raw_results": {}, "searches": searches}
+
+            # Monta contexto combinado para análise
+            context_parts = []
+            for project_id, data in collected.items():
+                context_parts.append(f"=== Projeto: {project_id} | Busca: '{data['query']}' ===")
+                if data["results"]:
+                    for r in data["results"]:
+                        context_parts.append(r["content"])
+                else:
+                    context_parts.append("(Nenhum fragmento encontrado para esta busca)")
+                context_parts.append("")
+
+            context_str = "\n\n".join(context_parts)
+            logger.info(f"Gerando análise cruzada com {len(collected)} projeto(s)...")
+            analysis = self.ollama.generate_response(analysis_prompt, context_str)
+
+            return {
+                "analysis": analysis,
+                "raw_results": {p: {"query": d["query"], "fragments_found": len(d["results"])} for p, d in collected.items()},
+                "searches": searches
+            }
+        except Exception as e:
+            logger.error(f"Erro na análise cruzada: {str(e)}")
+            return {"analysis": f"Erro: {str(e)}", "raw_results": {}, "searches": searches}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # MODO RAW — busca sem geração de resposta pelo modelo local
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _merge_overlapping_texts(self, text1: str, text2: str) -> str:
+        """Mescla dois textos que possuem sobreposição na junção (overlap)."""
+        min_len = min(len(text1), len(text2))
+        # Procura sobreposição na junção de até 2000 caracteres (nosso overlap padrão é 1000)
+        for i in range(min(min_len, 2000), 0, -1):
+            if text1.endswith(text2[:i]):
+                return text1 + text2[i:]
+        return text1 + "\n\n... [continuação] ...\n\n" + text2
+
+    def search_raw(self, question: str, project_id: str = None, n_results: int = None, threshold: float = None) -> dict:
+        """Busca vetorial que retorna fragmentos brutos SEM passar pelo modelo de geração.
+
+        O modelo chamador (Claude, Gemini, etc.) interpreta os resultados diretamente.
+        Usa apenas o modelo de embedding para gerar o vetor da pergunta.
+
+        Args:
+            question: Pergunta para busca semântica.
+            project_id: Filtra por projeto. None = todos.
+            n_results: Quantidade de resultados a buscar (antes do filtro de distância).
+            threshold: Distância máxima aceitável. Resultados acima são descartados.
+
+        Returns:
+            dict com: fragments (lista de hits), discarded (lista dos descartados),
+            threshold usado, project_id, cached (bool).
+        """
+        try:
+            # Cache instantâneo
+            cached = self._check_raw_cache(question, project_id)
+            if cached:
+                return cached
+
+            # Defaults do config
+            if n_results is None:
+                n_results = self.n_results
+            if threshold is None:
+                threshold = self.distance_threshold
+
+            logger.info(f"Busca RAW | Projeto: {project_id or 'global'} | Threshold: {threshold} | Pergunta: {question[:80]}")
+
+            # Embedding da pergunta (descarrega após uso — não precisa do modelo de chat)
+            question_embedding = self.ollama.get_embedding(question, auto_unload=True)
+
+            # Busca vetorial
+            if project_id:
+                results = self.db.search(question_embedding, project_id=project_id, n_results=n_results)
+            else:
+                results = self.db.search(question_embedding, project_id=None, n_results=n_results)
+
+            if not results:
+                return {
+                    "fragments": [],
+                    "discarded": [],
+                    "threshold": threshold,
+                    "project_id": project_id,
+                    "cached": False
+                }
+
+            # 1. Pré-processamento e Penalização Cossena para Locales / Traduções
+            translation_keywords = {"traduzir", "tradução", "traducao", "idioma", "locale", "lang", "translation", "dicionário", "dicionario"}
+            is_translation_query = any(kw in question.lower() for kw in translation_keywords)
+
+            processed_results = []
+            for doc in results:
+                meta = doc.get("metadata", {})
+                source_path = meta.get("source", "").lower().replace("\\", "/")
+                dist = doc["distance"]
+
+                is_locale_file = "/locales/" in source_path or "/langs/" in source_path or "es.lua" in source_path or "pt.lua" in source_path or "pl.lua" in source_path
+                if is_locale_file and not is_translation_query:
+                    dist = dist * 1.5
+                    logger.info(f" Penalização cossena aplicada ao arquivo de locale: {os.path.basename(source_path)} (distância de {doc['distance']:.4f} -> {dist:.4f})")
+
+                processed_results.append({
+                    "content": doc["content"],
+                    "metadata": doc["metadata"],
+                    "distance": dist
+                })
+
+            # 2. Filtragem pelo threshold de distância
+            filtered_entries = []
+            discarded = []
+            for entry in processed_results:
+                if entry["distance"] <= threshold:
+                    filtered_entries.append(entry)
+                else:
+                    discarded.append(entry)
+
+            # 2.1 Deduplicação de Conteúdo Exato
+            seen_contents = set()
+            unique_filtered_entries = []
+            for entry in filtered_entries:
+                # Normaliza espaçamento para comparação precisa e limpa
+                norm_content = " ".join(entry["content"].split())
+                if norm_content not in seen_contents:
+                    seen_contents.add(norm_content)
+                    unique_filtered_entries.append(entry)
+                else:
+                    logger.info(f" Chunk duplicado ignorado para o arquivo: {os.path.basename(entry['metadata'].get('source', ''))}")
+            
+            filtered_entries = unique_filtered_entries
+
+            # 3. Agrupamento e Fusão de Chunks Adjacentes (De-overlapping)
+            fragments = []
+            if filtered_entries:
+                by_source = {}
+                for entry in filtered_entries:
+                    src = entry["metadata"].get("source", "unknown")
+                    if src not in by_source:
+                        by_source[src] = []
+                    by_source[src].append(entry)
+
+                for src, entries in by_source.items():
+                    # Ordena pelo índice sequencial original do chunk
+                    entries.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
+
+                    merged_entries = []
+                    current = entries[0]
+
+                    for next_entry in entries[1:]:
+                        curr_idx = current["metadata"].get("chunk_index", 0)
+                        next_idx = next_entry["metadata"].get("chunk_index", 0)
+
+                        # Se os chunks forem sequenciais (contíguos)
+                        if next_idx == curr_idx + 1:
+                            logger.info(f" Mesclando chunks adjacentes {curr_idx} e {next_idx} do arquivo: {os.path.basename(src)}")
+                            merged_content = self._merge_overlapping_texts(current["content"], next_entry["content"])
+                            min_dist = min(current["distance"], next_entry["distance"])
+                            current = {
+                                "content": merged_content,
+                                "metadata": current["metadata"].copy(),
+                                "distance": min_dist
+                            }
+                            current["metadata"]["chunk_index"] = next_idx  # Atualiza index para permitir fusões consecutivas múltiplas
+                        else:
+                            merged_entries.append(current)
+                            current = next_entry
+
+                    merged_entries.append(current)
+                    fragments.extend(merged_entries)
+
+                # Reordena a lista final de blocos pela menor distância cossena
+                fragments.sort(key=lambda x: x["distance"])
+
+            # Salva log e cache
+            self._log_raw_results(question, fragments, discarded, threshold, project_id)
+
+            return {
+                "fragments": fragments,
+                "discarded": discarded,
+                "threshold": threshold,
+                "project_id": project_id,
+                "cached": False
+            }
+        except Exception as e:
+            logger.error(f"Erro na busca raw [{project_id or 'global'}]: {str(e)}")
+            return {
+                "fragments": [],
+                "discarded": [],
+                "threshold": threshold or self.distance_threshold,
+                "project_id": project_id,
+                "cached": False,
+                "error": str(e)
+            }
+
+    def _check_raw_cache(self, question: str, project_id: str = None) -> dict:
+        """Verifica cache para busca raw — retorna o resultado salvo se existir."""
+        folder = project_id if project_id else "global"
+        norm_q = self._normalize_question(question)
+        if not norm_q:
+            return None
+
+        index_data = self._get_cache_index()
+        if folder in index_data and norm_q in index_data[folder]:
+            cache_entry = index_data[folder][norm_q]
+            file_path = cache_entry.get("file_path")
+
+            if file_path and os.path.exists(file_path):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    logger.info(f"⚡ [CACHE HIT RAW] Resultado recuperado: {norm_q}")
+                    return {
+                        "fragments": [],
+                        "discarded": [],
+                        "threshold": self.distance_threshold,
+                        "project_id": project_id,
+                        "cached": True,
+                        "cached_file": file_path,
+                        "cached_content": content
+                    }
+                except Exception as e:
+                    logger.error(f"Erro ao ler cache raw {file_path}: {e}")
+        return None
+
+    def _log_raw_results(self, question: str, fragments: list, discarded: list, threshold: float, project_id: str = None):
+        """Salva os resultados brutos da busca vetorial em Markdown e atualiza o index.json."""
+        try:
+            folder = project_id if project_id else "global"
+            target_dir = os.path.join(self.history_dir, folder)
+            os.makedirs(target_dir, exist_ok=True)
+
+            timestamp = datetime.datetime.now()
+            ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+            ts_display = timestamp.strftime("%d/%m/%Y %H:%M:%S")
+
+            file_name = f"query_{ts_str}.md"
+            file_path = os.path.join(target_dir, file_name)
+
+            md_lines = [
+                f"# Busca RAG: {folder} ({ts_display})",
+                "",
+                "## ❓ Pergunta",
+                f"> {question}",
+                "",
+                f"## 📊 Resultados ({len(fragments)} fragmentos | threshold: {threshold} | descartados: {len(discarded)})",
+                ""
+            ]
+
+            for i, frag in enumerate(fragments, 1):
+                meta = frag.get("metadata", {})
+                source = meta.get("source", "desconhecido")
+                basename = os.path.basename(source)
+                category = meta.get("category", "N/A")
+                tags = meta.get("tags", [])
+                distance = frag.get("distance", 0)
+
+                md_lines.extend([
+                    f"### [{i}] {basename} — distância: {distance:.4f}",
+                    f"- **Fonte**: `{source}`",
+                    f"- **Categoria**: {category} | **Tags**: [{', '.join(tags)}]",
+                    "",
+                    "```",
+                    frag.get("content", "").strip(),
+                    "```",
+                    ""
+                ])
+
+            if discarded:
+                md_lines.extend([
+                    f"## ❌ Descartados (distância > {threshold})",
+                    "| Fonte | Distância |",
+                    "|---|---|"
+                ])
+                for d in discarded:
+                    d_meta = d.get("metadata", {})
+                    d_source = os.path.basename(d_meta.get("source", "?"))
+                    d_dist = d.get("distance", 0)
+                    md_lines.append(f"| `{d_source}` | {d_dist:.4f} |")
+                md_lines.append("")
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(md_lines))
+
+            # Atualiza Cache Index
+            norm_q = self._normalize_question(question)
+            if norm_q:
+                index_data = self._get_cache_index()
+                if folder not in index_data:
+                    index_data[folder] = {}
+                index_data[folder][norm_q] = {
+                    "file_path": file_path.replace("\\", "/"),
+                    "timestamp": ts_display,
+                    "question_raw": question,
+                    "mode": "raw",
+                    "fragments_count": len(fragments),
+                    "discarded_count": len(discarded)
+                }
+                self._save_cache_index(index_data)
+
+            logger.info(f"Resultado raw salvo em: {file_path}")
+
+        except Exception as e:
+            logger.error(f"Erro ao salvar log raw do RAG: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Utilitários
+    # ══════════════════════════════════════════════════════════════════════
+
     def list_indexed_sources(self, project_id: str = None) -> List[Dict[str, Any]]:
         """Lista todas as fontes únicas indexadas."""
+    def list_indexed_sources(self, project_id=None):
+        """Lista todas as fontes unicas indexadas."""
         return self.db.list_sources(project_id)
 
-    def clear_database(self, project_id: str = None) -> str:
-        """Limpa a base de dados (projeto específico ou global)."""
+    def clear_database(self, project_id=None):
+        """Limpa a base de dados (projeto especifico ou global)."""
         if project_id:
             return self.db.delete_by_project(project_id)
         else:

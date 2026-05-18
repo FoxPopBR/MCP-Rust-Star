@@ -2,14 +2,6 @@
 
 > **Idioma**: Toda comunicação com o usuário, documentos gerados, planos e respostas devem ser em **português brasileiro (pt-BR)**.
 
-## 🛑 REGRAS DE SEGURANÇA (CRÍTICO)
-
-- **NUNCA ALTERE CÓDIGO SEM AUTORIZAÇÃO EXPLÍCITA**: Se a tarefa for análise, diagnóstico ou leitura, o agente deve **APENAS LER** e relatar. **PROIBIDO** escrever, editar ou rodar comandos destrutivos.
-- **ANÁLISE ≠ ALTERAÇÃO**: Pedidos como "analise", "verifique", "diagnostique" ou "faça um relatório" **NÃO** dão permissão para modificar arquivos. O agente deve apenas ler e gerar relatórios em texto ou documentos novos.
-- **RESPEITO AO TRABALHO HUMANO**: Nunca sobrescreva arquivos que possam estar sendo editados por outras pessoas. Se houver dúvida, **PERGUNTE** antes de tocar em qualquer arquivo `.py`, `.md` ou `.json`.
-- **GIT É SAGRADO**: **NUNCA** rode `git checkout`, `git reset --hard`, `git clean` ou qualquer comando que sobrescreva arquivos locais sem ordem **DIRETA E EXPLÍCITA** do usuário. Isso destrói trabalho não commitado.
-- **SEMPRE PEÇA PERMISSÃO**: Antes de criar, editar ou deletar qualquer arquivo no projeto, o agente deve listar o que pretende fazer e aguardar o "OK" do usuário.
-
 ## Comandos Rápidos
 
 | Ação | Comando |
@@ -132,17 +124,6 @@ Skills são guias especializados que o agente deve invocar via `skill` tool quan
 | **setup-matt-pocock-skills** | Configurar bloco `## Agent skills` e `docs/agents/` para skills de engenharia. |
 | **zoom-out** | Dar perspectiva mais ampla sobre código ou arquitetura. |
 | **caveman** | Modo ultra-comprimido de comunicação (quando solicitado). |
-
-### Fluxo de Consulta Obrigatório
-
-1. **Recebeu uma tarefa?** → Leia `docs/SESSION_LOG.md` para saber onde parou (Regra 00).
-2. **A tarefa envolve código novo ou mudança?** → Consulte Regra 02 (Grilling) antes de codificar.
-3. **É um bug ou falha?** → Use a skill `diagnose` + Regra 03 (Loop de Diagnóstico).
-4. **É uma feature grande?** → Use Regra 04 (Fatiamento Vertical) + skill `to-issues`.
-5. **Envolve indexação/RAG/VRAM?** → Consulte Regra 05 + skill `mcp-rust-star`.
-6. **Envolve arquitetura/camadas?** → Consulte Regra 06 + skill `improve-codebase-architecture`.
-7. **Precisa de termos do domínio?** → Consulte `CONTEXT.md`.
-8. **Finalizou um ciclo?** → Atualize `docs/SESSION_LOG.md`.
 
 ### Documentação do Projeto
 

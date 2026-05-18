@@ -1,5 +1,5 @@
 """
-Script para limpar TODOS os dados do banco vetorial (Postgres ou ChromaDB).
+Script para limpar TODOS os dados do banco vetorial (PostgreSQL + pgvector).
 Executa antes de re-indexar tudo do zero.
 
 USO:

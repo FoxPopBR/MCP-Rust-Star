@@ -76,15 +76,15 @@ class PostgresStore:
 
     def _get_table_name(self, project_id: str) -> str:
         if not project_id:
-            return "knowledge_global"
+            return "rag_global"
         slug = re.sub(r'[^a-zA-Z0-9_]', '_', project_id.lower())
-        return f"knowledge_{slug}"[:63]
+        return f"rag_{slug}"[:63]
 
     def _get_all_tables(self) -> list:
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'knowledge_%';")
+                cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'rag_%';")
                 return [row[0] for row in cur.fetchall()]
         finally:
             self._release_conn(conn)

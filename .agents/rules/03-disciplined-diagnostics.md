@@ -1,3 +1,7 @@
+---
+trigger: model_decision
+---
+
 # Regra 03: Loop de Diagnóstico Disciplinado
 
 Bugs no MCP Rust Star não são "corrigidos", eles são "aniquilados" através de um processo científico.

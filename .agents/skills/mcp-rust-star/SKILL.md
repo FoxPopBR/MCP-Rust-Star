@@ -42,8 +42,25 @@ Execute sempre via `run_server.bat`. O script realiza:
 ### 🔍 Recuperação e Resposta (RAG)
 | Ferramenta | Parâmetros | Descrição |
 | :--- | :--- | :--- |
-| `ask_knowledge_base` | `question` (str), `project_id` (str) | Consulta principal. Recupera até 5 fragmentos (Top-K) para síntese profunda. |
+| `ask_knowledge_base` | `question` (str), `project_id` (str) | Consulta principal. Recupera fragmentos otimizados do banco PostgreSQL em formato bruto. |
 | `ask_rust_star` | `question` (str) | Atalho de alta prioridade para o projeto principal. |
+
+#### 📦 Filosofia do RAG: Material Bruto (Raw Data)
+O servidor MCP Rust Star foi projetado sob a filosofia de **Transparência Industrial**. As ferramentas de busca RAG retornam estritamente o **material bruto (Raw Data)** dos chunks (conteúdo do código, caminhos de arquivo originais, distâncias cossenas numéricas e tags de metadados), sem realizar resumos ou interpretações por modelos locais fracos.
+* **Por que isso é feito?** Para economizar VRAM do hardware local do usuário e evitar alucinações geradas por modelos pequenos. A análise, triagem e síntese final dos dados recuperados devem ser feitas de forma limpa pelo próprio assistente de elite (pago/nuvem) que consome o MCP.
+
+#### 📂 Persistência e Logs de Consultas (RAG History)
+Toda pesquisa realizada gera automaticamente um arquivo Markdown com o histórico completo e detalhado da query.
+* **Pasta de Destino:** Os relatórios brutos são salvos localmente na raiz do servidor sob a pasta:
+  - `logs/rag_history/<project_id>/query_<ano-mes-dia_hora-minuto-segundo>.md`
+* **Índice Geral:** O arquivo de índice [`logs/rag_history/index.json`](file:///c:/Phantasy/MCP%20Rust%20Star/logs/rag_history/index.json) rastreia e mapeia todas as queries executadas sequencialmente por projeto.
+
+#### ⚡ Protocolo Definitivo de Busca Híbrida (Term-Boosting)
+Para extrair a máxima fidelidade do espaço vetorial:
+1. **O Problema:** Arquivos de configurações puramente lógicos ou numéricos (ex: `stages.lua`) não contêm descrições em linguagem natural. Uma busca puramente conceitual em português os ignora.
+2. **A Solução (Hibridização Semântica):** Escreva a intenção lógica em português e anexe nomes de variáveis técnicos e nomes de arquivos originais em inglês entre colchetes ao final da frase.
+   - *Exemplo de Query de Elite:* `"qual é a taxa de evolução de xp do jogador [experienceStages multiplier rateExp stages.lua]"`
+3. **Funcionamento:** O português atrai as estruturas funcionais do jogador (ex: `login.lua`), enquanto as tags em inglês funcionam como âncoras de alta atração para puxar as tabelas matemáticas de `stages.lua` para o topo.
 
 ### ⚙️ Gestão de Sistema e Hardware
 | Ferramenta | Parâmetros | Descrição |
@@ -82,6 +99,13 @@ Você pode ajustar estes valores via `update_server_settings`:
 ### Caso C: Consulta RAG Global
 > "Qual a lógica de conexão com o banco de dados em todos os meus projetos?"
 - **Ação**: `ask_knowledge_base(question="...", project_id=None)`. O sistema buscará no PostgreSQL cruzando dados de todos os workspaces.
+
+### Caso D: Busca Híbrida (Term-Boosting) para Código Seco
+> "Qual é a taxa de evolução de xp do jogador? Preciso puxar o arquivo exato de stages e as variáveis envolvidas."
+- **Contexto**: Arquivos matemáticos ou lógicos secos (sem descrições em linguagem natural) são difíceis de recuperar por similaridade de pergunta conceitual.
+- **Ação**: Misture a intenção em português com palavras-chave e nomes de variáveis exatas em inglês no final da consulta.
+  - `ask_knowledge_base(question="qual é a taxa de evolução de xp do jogador [experienceStages multiplier rateExp stages.lua]", project_id="FoxOT")`
+- **Mecânica**: A parte em português atrai a semântica de lógica do "jogador" (ex: `login.lua`), enquanto as tags em colchetes em inglês funcionam como âncoras vetoriais de alta atração para puxar as tabelas matemáticas do arquivo `stages.lua`.
 
 ---
 

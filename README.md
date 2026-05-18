@@ -1,18 +1,22 @@
 # Rust Star MCP Knowledge Server
 
-Este é um servidor MCP projetado para fornecer inteligência e base de conhecimento para o projeto **Rust Star**. Ele utiliza **Ollama** local para embeddings e geração de texto, e **ChromaDB** para armazenamento vetorial.
+Servidor MCP de base de conhecimento RAG para os projetos **Rust Star**, **FoxOT** e **FoxClient**. Utiliza **Ollama** local para embeddings e geração de texto, e **PostgreSQL + pgvector** para armazenamento vetorial isolado por projeto.
 
 ## Requisitos
 
 - Python 3.10+
 - [Ollama](https://ollama.com/) rodando localmente.
+- Docker (para o container PostgreSQL + pgvector).
 - Modelos baixados no Ollama:
-  - `ollama pull qwen3-embedding:4b`
+  - `ollama pull qwen3-embedding:8b`
   - `ollama pull qwen3.5:9b`
 
 ## Instalação
 
-1. Clone ou copie os arquivos para a pasta do servidor.
+1. Suba o banco de dados:
+   ```bash
+   docker compose up -d
+   ```
 2. Instale as dependências:
    ```bash
    pip install -r requirements.txt
@@ -22,21 +26,32 @@ Este é um servidor MCP projetado para fornecer inteligência e base de conhecim
 ## Uso do Servidor MCP
 
 Para rodar o servidor:
-```bash
-python -m src.main
+```bat
+run_server.bat
 ```
 
-### Ferramentas Disponíveis
+### Ferramentas de Busca
 
-1. **`index_content(content, source)`**: Envia textos para serem memorizados pelo servidor. Ex: Lore do jogo, regras de arquitetura Rust, etc.
-2. **`ask_rust_star(question)`**: Faz uma pergunta que utiliza a base de conhecimento indexada para responder com precisão.
-3. **`check_ollama_status()`**: Verifica se a conexão com o Ollama está ativa e os modelos carregados.
-4. **`clear_knowledge_base()`**: Apaga toda a memória do servidor.
+| Ferramenta | Descrição |
+|---|---|
+| `search_project_knowledge(project_id, question)` | **Principal.** Busca isolada e rápida em um projeto específico. |
+| `search_all_projects_knowledge(question)` | Busca em todos os projetos (lenta). |
+| `cross_project_analysis(searches_json, analysis_prompt)` | Análise cruzada entre projetos com fila sequencial. |
+| `ask_knowledge_base(question, project_id)` | Busca RAG genérica (compatibilidade). |
+
+### Outras Ferramentas
+
+- **`register_project(project_id, path)`** — Registra uma pasta como projeto.
+- **`batch_index_projects()`** — Indexa todos os projetos registrados.
+- **`index_file(path)`** / **`index_directory(path)`** — Indexa arquivo ou pasta.
+- **`list_indexed_sources(project_id)`** — Lista arquivos indexados.
+- **`clear_knowledge_base(project_id)`** — Apaga memória de um projeto.
+- **`check_ollama_status()`** — Verifica conexão com Ollama.
 
 ## Estrutura do Projeto
 
 - `src/main.py`: Ponto de entrada e definição de ferramentas MCP.
 - `src/ollama_client.py`: Comunicação com a API do Ollama.
-- `src/vector_store.py`: Abstração do banco vetorial ChromaDB.
+- `src/vector_store_postgres.py`: Armazenamento vetorial PostgreSQL + pgvector (tabelas prefixo `rag_`).
 - `src/services/rag_service.py`: Lógica principal do pipeline RAG.
-- `data/`: Diretório de persistência do banco de dados vetorial.
+- `docker-compose.yml`: Container PostgreSQL + pgvector.

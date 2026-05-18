@@ -75,6 +75,53 @@ Para conectar ao servidor, use apenas as informações de conectividade. **NUNCA
 }
 ```
 
+### 🔌 Configuração para OpenCode (Modo HTTP Remoto)
+
+Quando o servidor MCP está rodando em modo HTTP, a configuração no `opencode.json` do projeto cliente usa o formato **remote**:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "mcp-rust-star": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8765/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+**Configuração completa (com GitHub MCP):**
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "github-mcp-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+      "enabled": true
+    },
+    "mcp-rust-star": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8765/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+**Como usar:**
+1. Inicie o servidor MCP Rust Star em modo HTTP na porta 8765
+2. Configure o `opencode.json` do projeto cliente com o bloco acima
+3. Reinicie o OpenCode para carregar o servidor remoto
+
+**Notas:**
+- O `url` deve apontar para o endpoint `/mcp` do servidor
+- O formato é `type: "remote"` + `url` — **não** use `serverURL`
+- Se o servidor estiver em outra máquina, troque `127.0.0.1` pelo IP da máquina host
+
 ---
 
 ## 5. Troubleshooting (Resolução de Problemas)

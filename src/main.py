@@ -1082,11 +1082,79 @@ async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: s
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HELPER: Formatação de resultados RAW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _format_raw_response(result: dict, scope: str) -> str:
+    """Formata o resultado de search_raw() para retorno nas ferramentas MCP."""
+
+    # Cache hit — retorna conteúdo do arquivo salvo
+    if result.get("cached"):
+        cached_file = result.get("cached_file", "?")
+        cached_content = result.get("cached_content", "")
+        return (
+            f"⚡ [CACHE HIT] Resultado recuperado instantaneamente.\n"
+            f"📄 Arquivo: {cached_file}\n\n"
+            f"{cached_content}"
+        )
+
+    fragments = result.get("fragments", [])
+    discarded = result.get("discarded", [])
+    threshold = result.get("threshold", 0.75)
+    error = result.get("error")
+
+    if error:
+        return f"Erro na busca: {error}"
+
+    if not fragments and not discarded:
+        return f"=== BUSCA [{scope}] ===\n\nNenhum fragmento encontrado na base de conhecimento."
+
+    lines = [
+        f"=== BUSCA [{scope}] | {len(fragments)} fragmentos (threshold: {threshold}) ===",
+        ""
+    ]
+
+    for i, frag in enumerate(fragments, 1):
+        meta = frag.get("metadata", {})
+        source = meta.get("source", "desconhecido")
+        basename = os.path.basename(source)
+        category = meta.get("category", "N/A")
+        tags = meta.get("tags", [])
+        distance = frag.get("distance", 0)
+
+        lines.extend([
+            f"[{i}/{len(fragments)}] 📁 {basename} | distância: {distance:.4f} | {category}",
+            f"Fonte: {source}",
+            f"Tags: [{', '.join(tags)}]",
+            "────────────────────",
+            frag.get("content", "").strip(),
+            "────────────────────",
+            ""
+        ])
+
+    if discarded:
+        lines.append(f"⊘ {len(discarded)} fragmentos descartados (distância > {threshold}):")
+        for d in discarded:
+            d_meta = d.get("metadata", {})
+            d_source = os.path.basename(d_meta.get("source", "?"))
+            d_dist = d.get("distance", 0)
+            lines.append(f"  • {d_source} (distância: {d_dist:.4f})")
+        lines.append("")
+
+    # Indica onde o resultado bruto foi salvo
+    project_id = result.get("project_id")
+    folder = project_id if project_id else "global"
+    lines.append(f"📄 Resultado salvo em: logs/rag_history/{folder}/")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FERRAMENTAS: Busca RAG
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp_tool_with_logging
-@with_model_guard(kind="chat")
+@with_model_guard(kind="embed")
 async def ask_knowledge_base(question: str, project_id: str = None) -> str:
     """Consulta a base de conhecimento com RAG. Retorna resposta com citação de fontes.
 
@@ -1102,25 +1170,79 @@ async def ask_knowledge_base(question: str, project_id: str = None) -> str:
     }
     _bus.emit("rag.query.received", {"question": question[:200], "project_id": project_id})
 
-    result = await asyncio.to_thread(rag.search_and_generate, question, project_id)
+    result = await asyncio.to_thread(rag.search_raw, question, project_id)
     target = project_id if project_id else "TODOS OS PROJETOS"
 
-    response = f"=== RESPOSTA [{target}] ===\n\n{result['answer']}\n\n"
+    return _format_raw_response(result, target)
 
-    if result.get("sources"):
-        response += "=== FONTES CONSULTADAS ===\n"
-        seen = set()
-        for meta in result["sources"]:
-            if meta:
-                src = meta.get("source", "desconhecido")
-                proj = meta.get("project_id", "?")
-                key = (proj, src)
-                if key not in seen:
-                    seen.add(key)
-                    response += f"  • [{proj}] {os.path.basename(src)}\n"
-    else:
-        response += "(Nenhum contexto específico encontrado na base de conhecimento)"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FERRAMENTAS: Busca Avançada por Projeto
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@mcp_tool_with_logging
+@with_model_guard(kind="embed")
+async def search_project_knowledge(project_id: str, question: str) -> str:
+    """[FERRAMENTA PRINCIPAL DE BUSCA] Busca isolada em um projeto específico.
+    Rápida e precisa. Use sempre que souber em qual projeto está a informação.
+    Para cruzar dados de múltiplos projetos, use cross_project_analysis.
+
+    Args:
+        project_id: Nome do projeto (ex: 'rust_star', 'foxot', 'foxclient', 'nova_rust').
+        question: O que você quer encontrar na base de conhecimento.
+    """
+    result = await asyncio.to_thread(rag.search_raw, question, project_id)
+    return _format_raw_response(result, project_id)
+
+
+@mcp_tool_with_logging
+@with_model_guard(kind="embed")
+async def search_all_projects_knowledge(question: str) -> str:
+    """[LENTA] Busca em TODOS os projetos simultaneamente.
+    ⚠️ AVISO DE DESEMPENHO: Percorre todas as tabelas do banco sequencialmente.
+    O tempo de resposta aumenta com o número de projetos indexados.
+    Use apenas quando não souber em qual projeto está a informação.
+    Prefira search_project_knowledge quando o projeto for conhecido.
+
+    Args:
+        question: O que você quer encontrar (buscado em todos os projetos).
+    """
+    result = await asyncio.to_thread(rag.search_raw, question, None)
+    return _format_raw_response(result, "TODOS OS PROJETOS")
+
+
+@mcp_tool_with_logging
+@with_model_guard(kind="embed")
+async def cross_project_analysis(searches_json: str, analysis_prompt: str) -> str:
+    """Busca em múltiplos projetos e gera análise cruzada dos dados coletados.
+    Executa as buscas em fila (uma de cada vez) para não sobrecarregar o Ollama,
+    depois combina todos os fragmentos encontrados e gera análise unificada.
+
+    Args:
+        searches_json: JSON com lista de buscas por projeto. Formato:
+                       [{"project_id": "nome", "query": "o que buscar"}, ...]
+                       Exemplo: [{"project_id": "rust_star", "query": "sistema de combate"},
+                                 {"project_id": "foxot", "query": "sistema de combate"}]
+        analysis_prompt: O que analisar/comparar com os dados coletados.
+                         Exemplo: "Compare as diferenças de implementação entre os projetos
+                                   e aponte os pontos em comum e as divergências."
+    """
+    try:
+        searches = json.loads(searches_json)
+    except json.JSONDecodeError as e:
+        return f"Erro: searches_json inválido. Use formato JSON válido.\nDetalhe: {e}"
+
+    result = await asyncio.to_thread(rag.cross_project_analysis, searches, analysis_prompt)
+
+    projects = list(result.get("raw_results", {}).keys())
+    response = f"=== ANÁLISE CRUZADA | {len(projects)} projeto(s): {', '.join(projects)} ===\n\n"
+
+    for proj, data in result.get("raw_results", {}).items():
+        frags = data.get("fragments_found", 0)
+        query = data.get("query", "")
+        response += f"  • {proj}: {frags} fragmento(s) encontrado(s) (busca: '{query}')\n"
+
+    response += f"\n=== ANÁLISE ===\n\n{result['analysis']}\n"
     return response
 
 
@@ -1264,14 +1386,14 @@ async def check_ollama_status() -> str:
 @mcp_tool_with_logging
 async def get_gpu_status() -> str:
     """Verifica uso atual de VRAM da GPU (apenas NVIDIA via nvidia-smi)."""
-    return await asyncio.to_thread(rag.ollama.get_gpu_usage)
+    return rag.ollama.get_gpu_usage()
 
 
 @mcp_tool_with_logging
 async def unload_vram() -> str:
-    """Descarrega os modelos Ollama da VRAM imediatamente (Ejeção de Emergência)."""
-    success = await asyncio.to_thread(rag.ollama.unload_models)
-    return "✓ Modelos descarregados. VRAM liberada." if success else "✗ Falha ao descarregar modelos."
+    """Descarrega os modelos Ollama da VRAM imediatamente (Ejecao de Emergencia)."""
+    success = rag.ollama.unload_models()
+    return "Modelos descarregados. VRAM liberada." if success else "Falha ao descarregar modelos."
 
 
 @mcp_tool_with_logging
@@ -1279,25 +1401,21 @@ async def clear_knowledge_base(project_id: str = None) -> str:
     """Limpa a base de dados vetorial.
 
     Args:
-        project_id: Se informado, limpa apenas este projeto. Caso contrário, limpa tudo.
+        project_id: Se informado, limpa apenas este projeto. Caso contrario, limpa tudo.
     """
     result = await asyncio.to_thread(rag.clear_database, project_id)
     return result
 
 
-# ─── Entry point ───────────────────────────────────────────────────────────────
+# --- Entry point --------------------------------------------------------------
 
 _heartbeat_stop = threading.Event()
-_heartbeat_thread: threading.Thread | None = None  # atribuído em __main__
+_heartbeat_thread: threading.Thread | None = None
 _exit_called = threading.Event()
 
 
 def handle_exit():
-    """Libera recursos ao encerrar o servidor (atexit + signal handlers).
-
-    Protegido por _exit_called para execução única — evita chamada dupla quando
-    o signal handler dispara sys.exit() que por sua vez aciona atexit.
-    """
+    """Libera recursos ao encerrar o servidor (atexit + signal handlers)."""
     if _exit_called.is_set():
         return
     _exit_called.set()
@@ -1331,62 +1449,32 @@ async def _windows_stdin_keepalive():
 
 
 if __name__ == "__main__":
-    import argparse
     import atexit
-    from src.services.lifecycle import startup_probes, setup_signal_handlers, write_pid_file
-
-    # ── CLI: --transport pode sobrescrever o valor de defaults.json ──────────────
-    _parser = argparse.ArgumentParser(
-        description="MCP Rust Star Knowledge Server",
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-    _parser.add_argument(
-        "--transport",
-        choices=["stdio", "streamable-http"],
-        default=None,
-        help=(
-            "Modo de transporte MCP.\n"
-            "  streamable-http  Servidor HTTP em %(default)s (padrão de defaults.json)\n"
-            "  stdio            Canal stdin/stdout (modo legado/IDE)\n"
-            "Se omitido, usa o valor de data/defaults.json (padrão: streamable-http)."
-        ),
-    )
-    _args = _parser.parse_args()
-    if _args.transport is not None:
-        # Argumento explícito na linha de comando tem prioridade máxima
-        _TRANSPORT = _args.transport
-    elif not sys.stdin.isatty():
-        # stdin é um pipe → chamado pelo IDE via config JSON → STDIO automático
-        _TRANSPORT = "stdio"
-    # else: terminal interativo → mantém o valor de defaults.json (streamable-http)
+    import signal
 
     atexit.register(handle_exit)
-    setup_signal_handlers(handle_exit)
 
-    # Probes: falha rápida se Ollama, PostgreSQL ou porta estiverem indisponíveis.
-    # Para STDIO: também verifica se o servidor HTTP está ativo (proteção de modo).
-    startup_probes(rag, _bus, _HOST, _PORT, transport=_TRANSPORT)
+    def _sig_handler(sig, frame):
+        handle_exit()
+        sys.exit(0)
 
+    signal.signal(signal.SIGTERM, _sig_handler)
+    try:
+        signal.signal(signal.SIGINT, _sig_handler)
+    except (OSError, ValueError):
+        pass
+
+    from src.services.lifecycle import write_pid_file
     write_pid_file()
 
-    # No Windows, quando rodando em modo STDIO legado (IDE), injeta a task de keepalive 
-    # no event loop para prevenir travamentos de deadlock do ProactorEventLoop ocioso.
-    if _TRANSPORT == "stdio":
+    logger.info("=== MCP RUST STAR KNOWLEDGE SERVER INICIADO ===")
+    _bus.emit("server.started", {})
+
+    _windows_task = None
+    if sys.platform == "win32":
         try:
-            loop = asyncio.get_event_loop()
+            _windows_task = asyncio.get_event_loop().create_task(_windows_stdin_keepalive())
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        loop.create_task(_windows_stdin_keepalive())
+            pass
 
-    # Inicia thread de heartbeat (10s) para manter dashboard atualizado e detectar crash
-    _heartbeat_thread = threading.Thread(
-        target=_telemetry.heartbeat_loop,
-        args=(_heartbeat_stop,),
-        daemon=True
-    )
-    _heartbeat_thread.start()
-
-    logger.info(f"=== MCP RUST STAR KNOWLEDGE SERVER PRONTO [{_TRANSPORT.upper()} {_HOST}:{_PORT}] ===")
     mcp.run(transport=_TRANSPORT)
