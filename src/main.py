@@ -203,6 +203,8 @@ def _embed_log(msg: str) -> None:
     logger.info(f"[EMBED] {msg}")
     _bus.emit("embed.log.appended", {})
 
+rag.log_callback = _embed_log
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE DE INDEXAÇÃO (com atualização de estado + retry)
@@ -222,18 +224,15 @@ def _collect_files_sync(abs_path: str, project_root: str, extension: str = None)
         dirs[:] = [d for d in dirs if not rag.config.is_ignored(os.path.join(root, d), project_root)]
         for file in files:
             file_path = os.path.join(root, file)
+            file_ext = os.path.splitext(file)[1].lower()
+            
+            # Imagens são completamente ignoradas na indexação normal de pastas
+            if file_ext in image_exts:
+                continue
+                
             if not rag.config.is_ignored(file_path, project_root):
                 if extension and not file.lower().endswith(extension.lower()):
                     continue
-                file_ext = os.path.splitext(file)[1].lower()
-                if file_ext in image_exts:
-                    file_abs = os.path.abspath(file_path)
-                    is_auto_folder = any(
-                        file_abs.startswith(os.path.abspath(f) + os.sep)
-                        for f in vision_cfg.get("auto_index_folders", [])
-                    )
-                    if not (vision_cfg.get("auto_index_images", False) or is_auto_folder):
-                        continue
                 eligible_files.append(file_path)
     return eligible_files
 
@@ -261,6 +260,12 @@ async def _walk_and_index_async(
     eligible_files = await asyncio.to_thread(_collect_files_sync, abs_path, project_root, extension)
     
     _embed_state["total_expected"] = len(eligible_files)
+    
+    # ⟲ GARBAGE COLLECTION (Apenas se for escaneamento global do projeto) ⟲
+    if os.path.abspath(abs_path) == os.path.abspath(project_root):
+        deleted_ghosts = await asyncio.to_thread(rag.cleanup_deleted_files, project_id, eligible_files)
+        if deleted_ghosts > 0:
+            _embed_log(f"Sincronização: {deleted_ghosts} fantasmas removidos do banco.")
     _embed_log(f"Pré-scan concluído: {len(eligible_files)} arquivos elegíveis.")
 
     # ── INDEXAÇÃO REAL ────────────────────────────────────────────────────────
@@ -315,9 +320,9 @@ async def _walk_and_index_async(
                 errors += 1
                 _embed_state["stats"]["errors"] += 1
 
-            # LOOKAHEAD DO MODEL GUARD: descarrega proativamente se houver tarefa de tipo diferente ou fila vazia
+            # LOOKAHEAD DO MODEL GUARD: descarrega proativamente se houver tarefa de tipo diferente aguardando
             next_kind = get_model_guard().peek_next_kind()
-            if next_kind != "embed":
+            if next_kind is not None and next_kind != "embed":
                 _embed_log(f"DEBUG: Lookahead detectou próxima tarefa de kind '{next_kind}'. Descarregando VRAM...")
                 await asyncio.to_thread(rag.ollama.unload_models)
 
@@ -405,6 +410,7 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
             for pid in project_ids_initial:
                 if pid in projects:
                     _embed_state["queue"].append({
+                        "kind": "project",
                         "project_id": pid,
                         "project_root": projects[pid],
                         "force": force,
@@ -418,60 +424,94 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
 
             while _embed_state["queue"] and _embed_state["running"]:
                 item = _embed_state["queue"].pop(0)
+                kind = item.get("kind", "project")
                 project_id = item["project_id"]
-                project_root = item["project_root"]
+                project_root = item.get("project_root")
                 item_force = item.get("force", force)
+                
+                if kind == "project":
+                    # Pula projetos já concluídos (a menos que force)
+                    if project_id in completed_prev and not item_force:
+                        prev = results.get(project_id, {})
+                        _embed_log(
+                            f"SKIP {project_id}: já indexado "
+                            f"({prev.get('new', '?')} novos, {prev.get('cached', '?')} cache)"
+                        )
+                        if project_id not in _embed_state["completed"]:
+                            _embed_state["completed"].append(project_id)
+                        continue
 
-                # Pula projetos já concluídos (a menos que force)
-                if project_id in completed_prev and not item_force:
-                    prev = results.get(project_id, {})
-                    _embed_log(
-                        f"SKIP {project_id}: já indexado "
-                        f"({prev.get('new', '?')} novos, {prev.get('cached', '?')} cache)"
-                    )
-                    if project_id not in _embed_state["completed"]:
-                        _embed_state["completed"].append(project_id)
-                    continue
+                    if not os.path.isdir(project_root):
+                        _embed_log(f"ERRO {project_id}: caminho inválido '{project_root}'")
+                        results[project_id] = {"status": "erro", "message": "caminho inválido"}
+                        save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                        continue
 
-                if not os.path.isdir(project_root):
-                    _embed_log(f"ERRO {project_id}: caminho inválido '{project_root}'")
-                    results[project_id] = {"status": "erro", "message": "caminho inválido"}
-                    save_batch_progress({"completed": sorted(completed_prev), "results": results})
-                    continue
+                    _embed_log(f"Processando: {project_id} | {project_root}")
 
-                _embed_log(f"Processando: {project_id} | {project_root}")
+                    try:
+                        # HEARTBEAT: Antes da indexação
+                        _embed_log(f"DEBUG: Iniciando _walk_and_index_async para {project_id}")
+                        stats = await asyncio.wait_for(
+                            _walk_and_index_async(project_id, project_root, project_root),
+                            timeout=3600  # Timeout de 1 hora por projeto
+                        )
+                        
+                        # HEARTBEAT: Após indexação, antes de descarregar VRAM
+                        _embed_log(f"DEBUG: Indexação concluída. Solicitando descarga de VRAM para {project_id}")
+                        await asyncio.to_thread(rag.ollama.unload_models)
+                        _embed_log(f"DEBUG: VRAM descarregada com sucesso.")
 
-                try:
-                    # HEARTBEAT: Antes da indexação
-                    _embed_log(f"DEBUG: Iniciando _walk_and_index_async para {project_id}")
-                    stats = await asyncio.wait_for(
-                        _walk_and_index_async(project_id, project_root, project_root),
-                        timeout=3600  # Timeout de 1 hora por projeto
-                    )
-                    
-                    # HEARTBEAT: Após indexação, antes de descarregar VRAM
-                    _embed_log(f"DEBUG: Indexação concluída. Solicitando descarga de VRAM para {project_id}")
-                    await asyncio.to_thread(rag.ollama.unload_models)
-                    _embed_log(f"DEBUG: VRAM descarregada com sucesso.")
+                        if project_id not in _embed_state["completed"]:
+                            _embed_state["completed"].append(project_id)
+                        completed_prev.add(project_id)
+                        results[project_id] = {"status": "ok", **stats}
+                        save_batch_progress({"completed": sorted(completed_prev), "results": results})
 
-                    if project_id not in _embed_state["completed"]:
-                        _embed_state["completed"].append(project_id)
-                    completed_prev.add(project_id)
-                    results[project_id] = {"status": "ok", **stats}
-                    save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                        _embed_log(
+                            f"OK {project_id}: {stats['new']} novos | "
+                            f"{stats['cached']} cache | "
+                            f"{stats['skipped']} ignorados | "
+                            f"{stats['errors']} erros"
+                        )
 
-                    _embed_log(
-                        f"OK {project_id}: {stats['new']} novos | "
-                        f"{stats['cached']} cache | "
-                        f"{stats['skipped']} ignorados | "
-                        f"{stats['errors']} erros"
-                    )
+                    except Exception as e:
+                        _embed_log(f"FALHA {project_id}: {str(e)[:120]}")
+                        results[project_id] = {"status": "erro", "message": str(e)}
+                        save_batch_progress({"completed": sorted(completed_prev), "results": results})
+                        # Continua para o próximo projeto
+                elif kind == "directory":
+                    path = item["path"]
+                    extension = item.get("extension")
+                    _embed_log(f"Processando diretório: {path} | Projeto: {project_id}")
+                    try:
+                        stats = await asyncio.wait_for(
+                            _walk_and_index_async(project_id, path, project_root, extension),
+                            timeout=3600
+                        )
+                        _embed_log(f"OK diretório: {path} ({stats['new']} novos, {stats['vision']} vision)")
+                    except Exception as e:
+                        _embed_log(f"FALHA diretório {path}: {str(e)[:120]}")
 
-                except Exception as e:
-                    _embed_log(f"FALHA {project_id}: {str(e)[:120]}")
-                    results[project_id] = {"status": "erro", "message": str(e)}
-                    save_batch_progress({"completed": sorted(completed_prev), "results": results})
-                    # Continua para o próximo projeto
+                elif kind == "file":
+                    path = item["path"]
+                    _embed_log(f"Processando arquivo: {path} | Projeto: {project_id}")
+                    try:
+                        async with get_model_guard().acquire("index_file", kind="embed"):
+                            result = await asyncio.to_thread(rag.index_file_by_path, path, project_id)
+                        _embed_log(f"OK arquivo: {path} | {result}")
+                    except Exception as e:
+                        _embed_log(f"FALHA arquivo {path}: {str(e)[:120]}")
+
+                elif kind == "image":
+                    path = item["path"]
+                    _embed_log(f"Processando imagem: {path} | Projeto: {project_id}")
+                    try:
+                        async with get_model_guard().acquire("index_image", kind="vision"):
+                            await asyncio.to_thread(rag.index_image, path, project_id)
+                        _embed_log(f"OK imagem: {path}")
+                    except Exception as e:
+                        _embed_log(f"FALHA imagem {path}: {str(e)[:120]}")
 
         finally:
             await asyncio.to_thread(rag.ollama.unload_models)
@@ -545,21 +585,34 @@ async def list_projects() -> str:
 # FERRAMENTAS: Indexação
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _queue_task(task: dict):
+    global _embed_task
+    _embed_state["queue"].append(task)
+    if _embed_task is None or _embed_task.done():
+        _embed_task = asyncio.create_task(_batch_embed_worker([], False))
+
+
+
 @mcp_tool_with_logging
-@with_model_guard(kind="embed")
 async def index_file(path: str) -> str:
     """Indexa um arquivo individual (.rs, .cpp, .h, .lua, .py, .md, .pdf, etc.).
     Detecta o projeto automaticamente pelo caminho."""
+    status = await asyncio.to_thread(rag.ollama.check_connection)
+    if not status["connected"]:
+        return f"Erro: Ollama offline em {rag.ollama.base_url}"
+
     if not os.path.exists(path):
         return f"Erro: Arquivo '{path}' não encontrado."
     project_id = get_project_for_path(path)
     if not project_id:
-        return (
-            f"Erro: '{path}' não pertence a nenhum projeto registrado. "
-            f"Use register_project primeiro."
-        )
-    result = await asyncio.to_thread(rag.index_file_by_path, path, project_id)
-    return f"{result} | Projeto: {project_id}"
+        return f"Erro: '{path}' não pertence a nenhum projeto registrado."
+    
+    _queue_task({
+        "kind": "file",
+        "project_id": project_id,
+        "path": path
+    })
+    return f"Arquivo '{path}' adicionado à fila de indexação (background)."
 
 
 @mcp_tool_with_logging
@@ -591,22 +644,15 @@ async def index_directory(path: str, extension: str = None) -> str:
     projects = load_projects()
     project_root = projects.get(project_id)
 
-    _embed_state["running"] = True
-    try:
-        stats = await _walk_and_index_async(project_id, abs_path, project_root, extension)
-    finally:
-        _embed_state["running"] = False
-
-    if stats["new"] > 0 or stats["vision"] > 0:
-        await asyncio.to_thread(rag.ollama.unload_models)
-
-    return (
-        f"Indexação concluída | Projeto: '{project_id}'\n"
-        f"  ✓ Novos:     {stats['new']} arquivo(s) ({stats['vision']} via Vision)\n"
-        f"  ⊙ Cache:     {stats['cached']} arquivo(s) inalterados (ignorados)\n"
-        f"  ○ Ignorados: {stats['skipped']} arquivo(s) por filtros\n"
-        f"  ✗ Erros:     {stats['errors']} arquivo(s)"
-    )
+    _queue_task({
+        "kind": "directory",
+        "project_id": project_id,
+        "project_root": project_root,
+        "path": abs_path,
+        "extension": extension
+    })
+    
+    return f"Diretório '{abs_path}' adicionado à fila de indexação (background)."
 
 
 @mcp_tool_with_logging
@@ -665,6 +711,7 @@ async def batch_index_projects(
         for pid in target_ids:
             if pid in projects:
                 _embed_state["queue"].append({
+                    "kind": "project",
                     "project_id": pid,
                     "project_root": projects[pid],
                     "force": force,
@@ -994,8 +1041,12 @@ async def index_image(path: str) -> str:
     project_id = get_project_for_path(path)
     if not project_id:
         return f"Erro: '{path}' não pertence a nenhum projeto registrado."
-    result = rag.index_image(path, project_id)
-    return f"Visão concluída: {result} | Projeto: {project_id}"
+    _queue_task({
+        "kind": "image",
+        "project_id": project_id,
+        "path": path
+    })
+    return f"Imagem '{path}' adicionada à fila de indexação (background)."
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1073,7 +1124,7 @@ async def analyze_screenshot(path: str, save_to_kb: bool = True, context_hint: s
                 f"CONTEXTO DO USUÁRIO: {context_hint or 'Não informado'}\n\n"
                 f"ANÁLISE TÉCNICA:\n{description}"
             )
-            rag.index_text(enriched_text, project_id, source=abs_path)
+            rag.index_text(enriched_text, abs_path, project_id)
             kb_status = f"\n\n[✓ Análise salva na base de conhecimento | Projeto: {project_id}]"
         else:
             kb_status = "\n\n[⚠ Nenhum projeto registrado. Análise não salva na KB.]"
@@ -1153,8 +1204,41 @@ def _format_raw_response(result: dict, scope: str) -> str:
 # FERRAMENTAS: Busca RAG
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _background_rag_task(question: str, project_id: str, custom_filename: str, tool_name: str) -> None:
+    """Executa a busca RAG em background respeitando o ModelGuard serializado."""
+    guard = get_model_guard()
+    try:
+        async with guard.acquire(tool_name, kind="embed"):
+            # Executa a busca vetorial (que realiza a geração do embedding via Ollama e salva em disco)
+            await asyncio.to_thread(rag.search_raw, question, project_id, None, None, custom_filename)
+            logger.info(f"✓ Busca RAG em background [{tool_name}] concluída e salva como {custom_filename}")
+    except Exception as e:
+        logger.error(f"Erro na busca RAG em background [{tool_name}]: {e}")
+
+
+def _write_rag_placeholder(folder: str, file_name: str, question: str, project_id: str) -> None:
+    """Escreve um arquivo placeholder temporário para sinalizar que o processamento está em andamento."""
+    try:
+        target_dir = os.path.join(rag.history_dir, folder)
+        os.makedirs(target_dir, exist_ok=True)
+        file_path = os.path.join(target_dir, file_name)
+        
+        now_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        content = (
+            f"# ⏳ Buscando Resultados RAG...\n\n"
+            f"A busca RAG está sendo processada em background. Por favor, aguarde e verifique este arquivo novamente em alguns segundos para visualizar os resultados.\n\n"
+            f"- **Pergunta**: {question}\n"
+            f"- **Projeto**: {project_id if project_id else 'global'}\n"
+            f"- **Iniciado em**: {now_str}\n"
+        )
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"Placeholder RAG criado em: {file_path}")
+    except Exception as e:
+        logger.error(f"Erro ao criar placeholder RAG: {e}")
+
+
 @mcp_tool_with_logging
-@with_model_guard(kind="embed")
 async def ask_knowledge_base(question: str, project_id: str = None) -> str:
     """Consulta a base de conhecimento com RAG. Retorna resposta com citação de fontes.
 
@@ -1170,10 +1254,29 @@ async def ask_knowledge_base(question: str, project_id: str = None) -> str:
     }
     _bus.emit("rag.query.received", {"question": question[:200], "project_id": project_id})
 
-    result = await asyncio.to_thread(rag.search_raw, question, project_id)
-    target = project_id if project_id else "TODOS OS PROJETOS"
-
-    return _format_raw_response(result, target)
+    # Verifica cache existente
+    cache_hit = rag._check_raw_cache(question, project_id)
+    folder = project_id if project_id else "global"
+    save_dir = os.path.abspath(os.path.join(rag.history_dir, folder))
+    
+    if cache_hit:
+        cached_file_path = cache_hit.get("cached_file")
+        file_name = os.path.basename(cached_file_path)
+    else:
+        timestamp = datetime.datetime.now()
+        ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        file_name = f"query_{ts_str}.md"
+        # Cria placeholder imediatamente para evitar "File Not Found"
+        _write_rag_placeholder(folder, file_name, question, project_id)
+        # Dispara background task
+        asyncio.create_task(_background_rag_task(question, project_id, file_name, "ask_knowledge_base"))
+        
+    return (
+        f"Seu pedido esta na fila de processamento, assim que finalizar envido msg avisando!\n"
+        f"O resultado vai ser salvo em:\n"
+        f"Diretório: {save_dir}\n"
+        f"Nome do arquivo: {file_name}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1181,7 +1284,6 @@ async def ask_knowledge_base(question: str, project_id: str = None) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp_tool_with_logging
-@with_model_guard(kind="embed")
 async def search_project_knowledge(project_id: str, question: str) -> str:
     """[FERRAMENTA PRINCIPAL DE BUSCA] Busca isolada em um projeto específico.
     Rápida e precisa. Use sempre que souber em qual projeto está a informação.
@@ -1191,12 +1293,36 @@ async def search_project_knowledge(project_id: str, question: str) -> str:
         project_id: Nome do projeto (ex: 'rust_star', 'foxot', 'foxclient', 'nova_rust').
         question: O que você quer encontrar na base de conhecimento.
     """
-    result = await asyncio.to_thread(rag.search_raw, question, project_id)
-    return _format_raw_response(result, project_id)
+    _server_extra["last_query"] = {
+        "question": question[:200],
+        "project_id": project_id,
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    _bus.emit("rag.query.received", {"question": question[:200], "project_id": project_id})
+
+    cache_hit = rag._check_raw_cache(question, project_id)
+    folder = project_id if project_id else "global"
+    save_dir = os.path.abspath(os.path.join(rag.history_dir, folder))
+    
+    if cache_hit:
+        cached_file_path = cache_hit.get("cached_file")
+        file_name = os.path.basename(cached_file_path)
+    else:
+        timestamp = datetime.datetime.now()
+        ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        file_name = f"query_{ts_str}.md"
+        _write_rag_placeholder(folder, file_name, question, project_id)
+        asyncio.create_task(_background_rag_task(question, project_id, file_name, "search_project_knowledge"))
+        
+    return (
+        f"Seu pedido esta na fila de processamento, assim que finalizar envido msg avisando!\n"
+        f"O resultado vai ser salvo em:\n"
+        f"Diretório: {save_dir}\n"
+        f"Nome do arquivo: {file_name}"
+    )
 
 
 @mcp_tool_with_logging
-@with_model_guard(kind="embed")
 async def search_all_projects_knowledge(question: str) -> str:
     """[LENTA] Busca em TODOS os projetos simultaneamente.
     ⚠️ AVISO DE DESEMPENHO: Percorre todas as tabelas do banco sequencialmente.
@@ -1207,8 +1333,33 @@ async def search_all_projects_knowledge(question: str) -> str:
     Args:
         question: O que você quer encontrar (buscado em todos os projetos).
     """
-    result = await asyncio.to_thread(rag.search_raw, question, None)
-    return _format_raw_response(result, "TODOS OS PROJETOS")
+    _server_extra["last_query"] = {
+        "question": question[:200],
+        "project_id": None,
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    _bus.emit("rag.query.received", {"question": question[:200], "project_id": None})
+
+    cache_hit = rag._check_raw_cache(question, None)
+    folder = "global"
+    save_dir = os.path.abspath(os.path.join(rag.history_dir, folder))
+    
+    if cache_hit:
+        cached_file_path = cache_hit.get("cached_file")
+        file_name = os.path.basename(cached_file_path)
+    else:
+        timestamp = datetime.datetime.now()
+        ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        file_name = f"query_{ts_str}.md"
+        _write_rag_placeholder(folder, file_name, question, None)
+        asyncio.create_task(_background_rag_task(question, None, file_name, "search_all_projects_knowledge"))
+        
+    return (
+        f"Seu pedido esta na fila de processamento, assim que finalizar envido msg avisando!\n"
+        f"O resultado vai ser salvo em:\n"
+        f"Diretório: {save_dir}\n"
+        f"Nome do arquivo: {file_name}"
+    )
 
 
 @mcp_tool_with_logging
@@ -1469,6 +1620,13 @@ if __name__ == "__main__":
 
     logger.info("=== MCP RUST STAR KNOWLEDGE SERVER INICIADO ===")
     _bus.emit("server.started", {})
+
+    _heartbeat_thread = threading.Thread(
+        target=_telemetry.heartbeat_loop,
+        args=(_heartbeat_stop,),
+        daemon=True
+    )
+    _heartbeat_thread.start()
 
     _windows_task = None
     if sys.platform == "win32":

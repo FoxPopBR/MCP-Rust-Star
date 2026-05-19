@@ -31,6 +31,9 @@ class RAGService:
         # Callback opcional disparado após cada mutação de estado.
         # main.py atribui um publisher de telemetria aqui.
         self._on_state_change = None
+        
+        # Callback opcional disparado para emitir logs no terminal de eventos
+        self.log_callback = None
 
         # Configuração de chunking
         settings = self.config.get_all().get("indexing", {})
@@ -287,9 +290,21 @@ class RAGService:
             if file_hash and hasattr(self.db, "check_hash"):
                 if self.db.check_hash(file_hash, project_id):
                     self.update_state(stats_inc={"cached": 1})
+                    if self.log_callback:
+                        self.log_callback(f"  > [CACHE HIT] {os.path.basename(source)}")
                     return "Cache Hit"
 
+            # Se chegou aqui, ou é arquivo novo ou o conteúdo mudou.
+            # Limpa qualquer versão anterior do arquivo no banco (Edição / Sincronização)
+            if hasattr(self.db, "delete_by_source"):
+                deleted = self.db.delete_by_source(source, project_id)
+                if deleted > 0:
+                    logger.debug(f"Arquivo modificado: {deleted} fragmentos antigos removidos de {source}.")
+
+
             logger.info(f"Indexando: {source} (Projeto: {project_id})")
+            if self.log_callback:
+                self.log_callback(f"Indexando: {os.path.basename(source)}")
             self.update_state(
                 current_file=os.path.basename(source),
                 current_folder=os.path.dirname(source),
@@ -300,6 +315,8 @@ class RAGService:
             chunks = splitter.split_text(text)
             total = len(chunks)
             logger.info(f"Dividido em {total} fragmentos ({os.path.splitext(source or '')[1] or 'texto'}).")
+            if self.log_callback:
+                self.log_callback(f"  > Dividido em {total} fragmento(s).")
 
             for i, chunk in enumerate(chunks):
                 is_last = i == total - 1
@@ -317,12 +334,18 @@ class RAGService:
                 # Heartbeat para arquivos grandes
                 if total > 10 and (i % 5 == 0 or is_last):
                     logger.info(f"  > Progresso {source}: Fragmento {i+1}/{total}...")
+                
+                if self.log_callback:
+                    if total <= 10 or (i % 5 == 0 or is_last):
+                        self.log_callback(f"  [FRAG] Processando fragmento {i+1}/{total}...")
 
                 try:
                     # Tentativa normal de gerar embedding
                     embedding = self.ollama.get_embedding(chunk, auto_unload=should_unload)
                 except Exception as e:
                     logger.warning(f"  ! Falha no fragmento {i+1}/{total} de {source}. Tentando subdividir... Erro: {str(e)}")
+                    if self.log_callback:
+                        self.log_callback(f"  ! Falha no fragmento {i+1}/{total}. Tentando subdividir...")
                     try:
                         # Subdivide o fragmento problemático em 4 pedaços menores
                         sub_size = len(chunk) // 4
@@ -332,16 +355,20 @@ class RAGService:
                             if not sub_chunk.strip(): continue
                             # Embedding para o sub-pedaço
                             sub_emb = self.ollama.get_embedding(sub_chunk, auto_unload=should_unload and sc_idx == len(sub_chunks)-1)
-                            sub_id = f"{str(uuid.uuid4())}_sub_{sc_idx}"
+                            sub_id = str(uuid.uuid4())
                             
                             logger.debug(f"  [DB] Gravando sub-fragmento {sc_idx}...")
                             self.db.add_document(sub_id, sub_emb, sub_chunk, {**metadata, "sub_chunk": sc_idx}, file_hash=file_hash)
                             logger.debug(f"  [DB] Sub-fragmento {sc_idx} OK.")
                         
                         logger.info(f"  ✓ Fragmento {i+1} recuperado via subdivisão.")
+                        if self.log_callback:
+                            self.log_callback(f"  ✓ Fragmento {i+1} recuperado via subdivisão.")
                         continue # Pula para o próximo fragmento principal
                     except Exception as sub_e:
                         logger.error(f"  ✗ Falha crítica no fragmento {i+1} mesmo após subdivisão: {str(sub_e)}")
+                        if self.log_callback:
+                            self.log_callback(f"  ✗ Falha crítica no fragmento {i+1} após subdivisão.")
                         self.update_state(stats_inc={"errors": 1})
                         continue
 
@@ -366,19 +393,65 @@ class RAGService:
         """Lê o arquivo, calcula MD5 e indexa se o conteúdo mudou desde a última indexação."""
         try:
             if not os.path.exists(file_path):
+                if self.log_callback:
+                    self.log_callback(f"Erro: Arquivo {os.path.basename(file_path)} não encontrado.")
                 return f"Erro: Arquivo {file_path} não encontrado."
 
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
 
             if not text.strip():
+                if self.log_callback:
+                    self.log_callback(f"Pulado: {os.path.basename(file_path)} está vazio.")
                 return "Arquivo vazio."
 
             return self.index_text(text, file_path, project_id, file_path=file_path, session_active=session_active)
         except Exception as e:
             logger.error(f"Erro ao ler/indexar arquivo {file_path}: {str(e)}")
+            if self.log_callback:
+                self.log_callback(f"Erro ao ler/indexar arquivo {os.path.basename(file_path)}: {str(e)}")
             self.update_state(stats_inc={"errors": 1})
             raise
+
+    def cleanup_deleted_files(self, project_id: str, current_files_on_disk: list[str]) -> int:
+        """Compara os arquivos no banco com os arquivos reais no disco e deleta os fantasmas."""
+        if not hasattr(self.db, "list_sources") or not hasattr(self.db, "delete_by_source"):
+            return 0
+            
+        try:
+            logger.info(f"Iniciando Garbage Collection para o projeto {project_id}...")
+            if self.log_callback:
+                self.log_callback(f"Iniciando Sincronização/Limpeza (Garbage Collection)...")
+                
+            indexed_sources = self.db.list_sources(project_id)
+            # Normalizar os caminhos para facilitar comparação
+            disk_paths = {os.path.normpath(os.path.abspath(f)) for f in current_files_on_disk}
+            
+            deleted_count = 0
+            for item in indexed_sources:
+                source = item.get("source")
+                if not source:
+                    continue
+                norm_source = os.path.normpath(os.path.abspath(source))
+                
+                # Se a fonte que está no banco NÃO existe mais na lista de arquivos escaneados
+                if norm_source not in disk_paths:
+                    logger.info(f"Garbage Collection: Removendo arquivo fantasma do banco: {source}")
+                    if self.log_callback:
+                        self.log_callback(f"  > [GC DELETED] Removendo arquivo excluído/movido: {os.path.basename(source)}")
+                    self.db.delete_by_source(source, project_id)
+                    deleted_count += 1
+                    
+            if deleted_count > 0:
+                logger.info(f"Garbage Collection: {deleted_count} arquivos fantasmas removidos do projeto {project_id}.")
+                if self.log_callback:
+                    self.log_callback(f"Sincronização concluída: {deleted_count} arquivos fantasmas limpos do banco.")
+                    
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Erro no Garbage Collection do RAG: {str(e)}")
+            return 0
+
 
     def search_and_generate(self, question: str, project_id: str = None) -> dict:
         """Realiza busca vetorial e gera resposta RAG."""
@@ -551,7 +624,7 @@ class RAGService:
                 return text1 + text2[i:]
         return text1 + "\n\n... [continuação] ...\n\n" + text2
 
-    def search_raw(self, question: str, project_id: str = None, n_results: int = None, threshold: float = None) -> dict:
+    def search_raw(self, question: str, project_id: str = None, n_results: int = None, threshold: float = None, custom_filename: str = None) -> dict:
         """Busca vetorial que retorna fragmentos brutos SEM passar pelo modelo de geração.
 
         O modelo chamador (Claude, Gemini, etc.) interpreta os resultados diretamente.
@@ -686,7 +759,7 @@ class RAGService:
                 fragments.sort(key=lambda x: x["distance"])
 
             # Salva log e cache
-            self._log_raw_results(question, fragments, discarded, threshold, project_id)
+            self._log_raw_results(question, fragments, discarded, threshold, project_id, custom_filename=custom_filename)
 
             return {
                 "fragments": fragments,
@@ -736,7 +809,7 @@ class RAGService:
                     logger.error(f"Erro ao ler cache raw {file_path}: {e}")
         return None
 
-    def _log_raw_results(self, question: str, fragments: list, discarded: list, threshold: float, project_id: str = None):
+    def _log_raw_results(self, question: str, fragments: list, discarded: list, threshold: float, project_id: str = None, custom_filename: str = None):
         """Salva os resultados brutos da busca vetorial em Markdown e atualiza o index.json."""
         try:
             folder = project_id if project_id else "global"
@@ -744,10 +817,14 @@ class RAGService:
             os.makedirs(target_dir, exist_ok=True)
 
             timestamp = datetime.datetime.now()
-            ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
             ts_display = timestamp.strftime("%d/%m/%Y %H:%M:%S")
 
-            file_name = f"query_{ts_str}.md"
+            if custom_filename:
+                file_name = custom_filename
+            else:
+                ts_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+                file_name = f"query_{ts_str}.md"
+
             file_path = os.path.join(target_dir, file_name)
 
             md_lines = [
@@ -819,6 +896,43 @@ class RAGService:
     # ══════════════════════════════════════════════════════════════════════
     # Utilitários
     # ══════════════════════════════════════════════════════════════════════
+
+    def index_image(self, file_path: str, project_id: str) -> str:
+        """Processa uma imagem com Vision, extrai descrição e indexa no vetor."""
+        try:
+            if not os.path.exists(file_path):
+                if self.log_callback:
+                    self.log_callback(f"Erro: Imagem {os.path.basename(file_path)} não encontrada.")
+                return f"Erro: Imagem {file_path} não encontrada."
+
+            logger.info(f"Indexando Imagem via Vision: {file_path} (Projeto: {project_id})")
+            if self.log_callback:
+                self.log_callback(f"Indexando Imagem (Vision): {os.path.basename(file_path)}")
+            self.update_state(
+                current_file=os.path.basename(file_path),
+                current_folder=os.path.dirname(file_path),
+                project_id=project_id
+            )
+
+            # Extrai descrição via Ollama Vision
+            description = self.ollama.describe_image(file_path)
+
+            if not description or not description.strip():
+                self.update_state(stats_inc={"errors": 1})
+                if self.log_callback:
+                    self.log_callback(f"  ✗ Falha ao gerar descrição Vision para {os.path.basename(file_path)}")
+                return "Falha ao gerar descrição da imagem ou descrição vazia."
+
+            # O contexto da imagem é a descrição textutal dela.
+            context = f"Arquivo de Imagem: {os.path.basename(file_path)}\n\nDescrição Vision:\n{description}"
+            
+            # Adiciona metadados extra no texto para a indexação
+            return self.index_text(context, file_path, project_id, file_path=file_path)
+            
+        except Exception as e:
+            logger.error(f"Erro ao indexar imagem {file_path}: {str(e)}")
+            self.update_state(stats_inc={"errors": 1})
+            raise
 
     def list_indexed_sources(self, project_id: str = None) -> List[Dict[str, Any]]:
         """Lista todas as fontes únicas indexadas."""

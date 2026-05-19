@@ -223,7 +223,7 @@
   },
   "rag": {
     "n_results": 5,
-    "context_window": 12288,
+    "context_window": 32768,
     "distance_threshold": 0.75
   }
 }

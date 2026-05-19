@@ -202,21 +202,45 @@ class PostgresStore:
     def get_inventory_stats(self, project_id: str = None) -> list:
         """Retorna estatísticas de (project_id, file_count, fragment_count, extensions_stats)."""
         try:
-            tables = [self._get_table_name(project_id)] if project_id else self._get_all_tables()
-            if not tables:
-                return []
+            # Tenta carregar projetos registrados para sempre exibi-los no dashboard
+            registered_projects = {}
+            try:
+                reg_file = os.path.join("data", "projects.json")
+                if os.path.exists(reg_file):
+                    with open(reg_file, "r", encoding="utf-8") as f:
+                        registered_projects = json.load(f)
+            except Exception:
+                pass
                 
+            tables = [self._get_table_name(project_id)] if project_id else self._get_all_tables()
             results = []
+            
+            # Adiciona os projetos registrados vazios primeiro
+            for pid in registered_projects.keys():
+                if project_id and pid != project_id:
+                    continue
+                results.append({
+                    "project_id": pid,
+                    "file_count": 0,
+                    "frag_count": 0,
+                    "extensions": {}
+                })
+                
+            if not tables:
+                return sorted(results, key=lambda x: x["project_id"])
+                
             conn = self._get_conn()
             try:
                 with conn.cursor() as cur:
                     for t in tables:
+                        # Extrai o slug do nome da tabela (rag_slug)
+                        slug = t.replace("rag_", "")
+                        
                         # 1. Total de fragmentos
                         cur.execute(f"SELECT COUNT(*) FROM {t}")
                         frag_count = cur.fetchone()[0]
                         
                         # 2. Total de arquivos únicos e estatísticas de extensão
-                        # Usamos metadata->>'source' para identificar arquivos
                         cur.execute(f"""
                             SELECT 
                                 metadata->>'project_id' as pid,
@@ -228,19 +252,31 @@ class PostgresStore:
                         
                         file_count = len(rows)
                         ext_counter = Counter()
-                        actual_pid = project_id or "global"
+                        actual_pid = project_id or slug
                         
                         for r_pid, r_src in rows:
                             if r_pid: actual_pid = r_pid
                             ext = os.path.splitext(r_src or "")[1].lower() or "(sem-ext)"
                             ext_counter[ext] += 1
                             
-                        results.append({
-                            "project_id": actual_pid,
-                            "file_count": file_count,
-                            "frag_count": frag_count,
-                            "extensions": dict(ext_counter)
-                        })
+                        # Atualiza o resultado ou adiciona se não existir
+                        found = False
+                        for res in results:
+                            # Compara ignorando cases e _ (já que o banco salva slug)
+                            if res["project_id"].replace(" ", "_").lower() == actual_pid.replace(" ", "_").lower():
+                                res["file_count"] = file_count
+                                res["frag_count"] = frag_count
+                                res["extensions"] = dict(ext_counter)
+                                res["project_id"] = actual_pid  # Preserva o nome com maiúsculas
+                                found = True
+                                break
+                        if not found:
+                            results.append({
+                                "project_id": actual_pid,
+                                "file_count": file_count,
+                                "frag_count": frag_count,
+                                "extensions": dict(ext_counter)
+                            })
             finally:
                 self._release_conn(conn)
             
@@ -278,6 +314,28 @@ class PostgresStore:
         except Exception as e:
             logger.error(f"Erro ao listar fontes no Postgres: {str(e)}")
             return []
+
+    def delete_by_source(self, source: str, project_id: str) -> int:
+        """Remove todos os fragmentos de um arquivo específico."""
+        try:
+            table_name = self._get_table_name(project_id)
+            conn = self._get_conn()
+            deleted_count = 0
+            try:
+                with conn.cursor() as cur:
+                    # Verifica se a tabela existe
+                    cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = %s);", (table_name,))
+                    if cur.fetchone()[0]:
+                        cur.execute(f"DELETE FROM {table_name} WHERE metadata->>'source' = %s", (source,))
+                        deleted_count = cur.rowcount
+            finally:
+                self._release_conn(conn)
+            if deleted_count > 0:
+                logger.debug(f"Removidos {deleted_count} fragmentos antigos do arquivo {source}.")
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Erro ao deletar documento por source no Postgres: {str(e)}")
+            return 0
 
     def delete_by_project(self, project_id: str):
         """Remove todos os dados de um projeto."""

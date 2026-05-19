@@ -33,8 +33,10 @@ class OllamaClient:
         self.base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         self.embedding_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:4b")
         self.rag_model = os.getenv("RAG_MODEL", "qwen3.5:4b")
-        # Janela de contexto calibrada: 12k tokens (~5.9GB VRAM footprint para Qwen 4b)
-        self.num_ctx = 12288
+        self.vision_model = os.getenv("VISION_MODEL", "llama3.2-vision")
+        # Janela de contexto otimizada: 32k tokens
+        # Viável com Flash Attention + KV cache q8_0 + modelo 4b (~4.6GB total na VRAM)
+        self.num_ctx = 32768
 
         try:
             self.client = ollama.Client(host=self.base_url)
@@ -52,7 +54,7 @@ class OllamaClient:
             response = self.client.embeddings(
                 model=self.embedding_model,
                 prompt=text,
-                options={"timeout": 60, "num_ctx": self.num_ctx}
+                options={"timeout": 60, "num_ctx": self.num_ctx, "num_gpu": -1}
             )
             if auto_unload:
                 self._unload_model(self.embedding_model, is_chat=False)
@@ -82,7 +84,7 @@ class OllamaClient:
                     {"role": "system", "content": _SYSTEM_PROMPT_CODE},
                     {"role": "user",   "content": user_content},
                 ],
-                options={"num_ctx": self.num_ctx, "timeout": 90},
+                options={"num_ctx": self.num_ctx, "timeout": 90, "num_gpu": -1},
             )
 
             self._unload_model(self.rag_model, is_chat=True)
@@ -144,10 +146,10 @@ class OllamaClient:
             with open(image_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("utf-8")
 
-            logger.info(f"Processando imagem Vision: {image_path}")
+            logger.info(f"Processando imagem Vision: {image_path} com {self.vision_model}")
 
             response = self.client.chat(
-                model=self.rag_model,
+                model=self.vision_model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT_VISION},
                     {
@@ -156,10 +158,10 @@ class OllamaClient:
                         "images": [b64],
                     },
                 ],
-                options={"num_ctx": self.num_ctx},
+                options={"num_ctx": 2048, "num_gpu": -1},
             )
 
-            self._unload_model(self.rag_model, is_chat=True)
+            self._unload_model(self.vision_model, is_chat=True)
             return response["message"]["content"]
 
         except Exception as e:

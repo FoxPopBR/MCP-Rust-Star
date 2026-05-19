@@ -216,9 +216,11 @@ class TelemetryWriter:
         server_extra = server_extra or {}
 
         inventory = {}
+        db_ok = False
         if self._inventory is not None:
             try:
                 inventory = self._inventory.fetch()
+                db_ok = True
             except Exception as e:
                 logger.warning(f"TelemetryWriter: inventory fetch falhou: {e}")
 
@@ -239,6 +241,7 @@ class TelemetryWriter:
                 "alive": True,
                 "activity": self._current_activity_label(),
                 "last_query": server_extra.get("last_query"),
+                "db_ok": db_ok,
             },
             "indexing": {
                 "running": embed_state.get("running", False),
@@ -313,7 +316,18 @@ class TelemetryWriter:
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self._state_file)
+            
+            # Tentativa de os.replace com retry para mitigar conflito de lock no Windows
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    os.replace(tmp_path, self._state_file)
+                    break
+                except (PermissionError, OSError) as re_err:
+                    if attempt == max_retries - 1:
+                        logger.warning(f"TelemetryWriter._atomic_write falhou após {max_retries} tentativas: {re_err}")
+                    else:
+                        time.sleep(0.05)
         except Exception as e:
             logger.warning(f"TelemetryWriter._atomic_write falhou: {e}")
             try:

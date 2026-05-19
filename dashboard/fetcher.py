@@ -1,6 +1,7 @@
 import os
 import json
 import urllib.request
+import urllib.error
 import threading
 
 from .log import log
@@ -127,6 +128,8 @@ class DataFetcher:
             "running": indexing.get("running", False),
             "inventory": inventory,
             "last_query": server.get("last_query") or {},
+            "error_files": indexing.get("error_files", []) or [],
+            "db_ok": server.get("db_ok", False),
         }
 
         # Painel batch lê queue/completed/current/total e o estado running.
@@ -151,6 +154,7 @@ class DataFetcher:
     # ── HTTP polling ───────────────────────────────────────────────────────────
 
     def _refresh_http(self) -> None:
+        # 1. Ollama health check
         online = False
         try:
             with urllib.request.urlopen(
@@ -172,9 +176,20 @@ class DataFetcher:
             except Exception as e:
                 log.warning("Ollama /api/ps: %s", e)
 
+        # 2. MCP Server health check (TCP connect — não envia HTTP para não criar sessões)
+        mcp_alive = False
+        import socket
+        try:
+            sock = socket.create_connection(("127.0.0.1", 8765), timeout=1)
+            sock.close()
+            mcp_alive = True
+        except (OSError, ConnectionRefusedError):
+            mcp_alive = False
+
         with self._lock:
             self._data["online"] = online
             self._data["ps"] = ps_data
+            self._data["mcp_alive"] = mcp_alive
 
     # ── API pública ────────────────────────────────────────────────────────────
 

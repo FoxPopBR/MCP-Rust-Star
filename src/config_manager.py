@@ -87,13 +87,13 @@ class ConfigManager:
         self._gitignore_cache[project_root] = processed_patterns
         return processed_patterns
 
-    def is_ignored(self, file_path: str, project_root: str = None):
+    def is_ignored(self, file_path: str, project_root: str = None, ignore_ext_check: bool = False):
         settings = self.current_settings["indexing"]
         name = os.path.basename(file_path)
         is_dir = os.path.isdir(file_path)
 
         # 0. Filtro de Extensão (APENAS PARA ARQUIVOS)
-        if not is_dir:
+        if not is_dir and not ignore_ext_check:
             ext = os.path.splitext(file_path)[1].lower()
             
             # Whitelist
