@@ -222,3 +222,35 @@ def test_snapshot_tem_campos_obrigatorios(tmp_path):
     assert data["version"] == 2
     assert data["server"]["alive"] is True
     assert data["server"]["activity"] in ("idle", "active", "error")
+
+
+def test_current_folder_retrieval(tmp_path):
+    """Verifica que o current_folder é priorizado do embed_state, com fallback para rag_state."""
+    bus = EventBus()
+    embed_state = {"running": True, "log_lines": [], "current_folder": "/path/to/embed/folder"}
+    rag_state = {"current_folder": "/path/to/rag/folder"}
+    writer = TelemetryWriter(
+        state_file=str(tmp_path / "state.json"),
+        bus=bus,
+        get_embed_state_fn=lambda: embed_state,
+        get_rag_state_fn=lambda: rag_state,
+    )
+    
+    bus.emit("embed.file.processing", {})
+    time.sleep(0.05)
+    
+    state_file = str(tmp_path / "state.json")
+    with open(state_file, encoding="utf-8") as f:
+        data = json.load(f)
+        
+    assert data["indexing"]["current_folder"] == "/path/to/embed/folder"
+    
+    # Se embed_state não tiver current_folder, deve pegar do rag_state
+    embed_state.pop("current_folder")
+    time.sleep(0.3)  # Aguarda expirar o throttle de 250ms
+    bus.emit("embed.file.processing", {})
+    time.sleep(0.05)
+    
+    with open(state_file, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["indexing"]["current_folder"] == "/path/to/rag/folder"

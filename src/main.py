@@ -178,6 +178,7 @@ _embed_state: dict = {
     "canceled": False,
     "current_project": None,
     "current_file": None,
+    "current_folder": None,
     "total_expected": 0,
     "stats": {"new": 0, "cached": 0, "skipped": 0, "errors": 0},
     "stats_by_ext": {},       # {"ext": count} for embedded files
@@ -275,6 +276,7 @@ async def _walk_and_index_async(
             break
 
         _embed_state["current_file"] = os.path.relpath(file_path, project_root)
+        _embed_state["current_folder"] = os.path.dirname(file_path)
         _bus.emit("embed.file.processing", {})
 
         # Serializa via ModelGuard de forma granular para esta chamada específica
@@ -392,6 +394,7 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
     _embed_state["log_lines"] = []
     _embed_state["completed"] = []
     _embed_state["current_file"] = None
+    _embed_state["current_folder"] = None
     _embed_state["current_project"] = None
 
     with _telemetry.activity():
@@ -518,6 +521,7 @@ async def _batch_embed_worker(project_ids_initial: list, force: bool = False) ->
             _embed_state["running"] = False
             _embed_state["current_project"] = None
             _embed_state["current_file"] = None
+            _embed_state["current_folder"] = None
             _embed_state["finished_at"] = datetime.datetime.now().isoformat()
 
             # Limpa progresso apenas se concluiu tudo sem cancelamento

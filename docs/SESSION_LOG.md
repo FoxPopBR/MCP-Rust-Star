@@ -3,7 +3,34 @@
 Este documento é o registro mestre de transição entre sessões. Ele detalha o estado atual do projeto, marcos alcançados e o planejamento imediato para a continuidade do desenvolvimento.
 
 
--## 🗓️ Sessão: 18/05/2026 (Parte 17) — Otimizações no RAG: Deduplicação, De-overlapping, Filtro de Locales, Busca Híbrida e Logs de Histórico
+## 🗓️ Sessão: 19/05/2026 (Parte 18) — Correção de Sincronização do Campo Pasta no Dashboard e Telemetria
+
+### Contexto
+O usuário notou que o dashboard exibia incorretamente a pasta de outro projeto (ex: FoxOT) enquanto realizava indexações (embeds) no projeto atual (ex: MCP Rust Star). Isso ocorria porque os cache hits e arquivos pulados não atualizavam o estado local do RAG e o TelemetryWriter lia a pasta de forma rígida apenas a partir do estado do RAG, que retinha valores obsoletos de sessões anteriores.
+
+### Conquistas
+- **Sincronização de Estado em Cache Hits**:
+  - Ajustado o método `index_text` em [`src/services/rag_service.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py) para que, em caso de cache hit, ele atualize corretamente os campos `current_file`, `current_folder` e `project_id` antes de retornar.
+- **Rastreamento de Pasta no Embed de Background**:
+  - Modificado o worker de background em [`src/main.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/main.py) para inicializar, atualizar granularmente a cada arquivo visitado (incluindo imagens ignoradas ou cache hits) e limpar o campo `current_folder` no dicionário global de estado de lote `_embed_state`.
+- **Junção Inteligente no TelemetryWriter**:
+  - Refatorado o [`src/services/telemetry_writer.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/telemetry_writer.py) para ler a pasta atual a partir de `embed_state.get("current_folder")`, com fallback seguro para `rag_state.get("current_folder")`. Isso garante consistência total da interface do usuário em tempo real durante processos batch.
+- **Testes Unitários de Telemetria**:
+  - Adicionado caso de teste robusto `test_current_folder_retrieval` em [`tests/dashboard/test_telemetry_event_driven.py`](file:///c:/Phantasy/MCP%20Rust%20Star/tests/dashboard/test_telemetry_event_driven.py), validando a prioridade de leitura de `current_folder` a partir do estado de embed e o fallback correto sob restrições de throttle.
+  - Suíte de 81 testes rodando em 100% verde com absoluto sucesso.
+
+### Arquivos Modificados nesta Sessão
+| Arquivo | Mudança |
+|---|---|
+| [`src/services/rag_service.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py) | /c:/Phantasy/MCP%20Rust%20Star/src/services/rag_service.py |
+| [`src/main.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/main.py) | Gestão e atualização do campo `current_folder` no estado do lote de background. |
+| [`src/services/telemetry_writer.py`](file:///c:/Phantasy/MCP%20Rust%20Star/src/services/telemetry_writer.py) | Integração dinâmica de `current_folder` no payload de telemetria serializado. |
+| [`tests/dashboard/test_telemetry_event_driven.py`](file:///c:/Phantasy/MCP%20Rust%20Star/tests/dashboard/test_telemetry_event_driven.py) | Inserção do teste unitário de concorrência e integridade para o novo fluxo de estado. |
+| [`docs/SESSION_LOG.md`](file:///c:/Phantasy/MCP%20Rust%20Star/docs/SESSION_LOG.md) | Esta entrada (Parte 18). |
+
+---
+
+## 🗓️ Sessão: 18/05/2026 (Parte 17) — Otimizações no RAG: Deduplicação, De-overlapping, Filtro de Locales, Busca Híbrida e Logs de Histórico
 
 ### Contexto
 Otimização profunda do pipeline de busca semântica em modo Raw no servidor MCP Rust Star, visando eliminar a poluição de dados, redundâncias nos chunks retornados e formalizar os novos métodos de busca híbrida altamente eficientes, economizando recursos e fornecendo dados puros de alta qualidade.

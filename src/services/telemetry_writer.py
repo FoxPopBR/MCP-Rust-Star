@@ -248,7 +248,7 @@ class TelemetryWriter:
                 "canceled": embed_state.get("canceled", False),
                 "current_project": embed_state.get("current_project"),
                 "current_file": embed_state.get("current_file"),
-                "current_folder": rag_state.get("current_folder", ""),
+                "current_folder": embed_state.get("current_folder") or rag_state.get("current_folder", ""),
                 "current_fragment": embed_state.get("current_fragment"),
                 "total_fragments": embed_state.get("total_fragments"),
                 "total_expected": embed_state.get("total_expected", 0),

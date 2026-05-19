@@ -289,7 +289,12 @@ class RAGService:
             # Verificação de cache por hash MD5
             if file_hash and hasattr(self.db, "check_hash"):
                 if self.db.check_hash(file_hash, project_id):
-                    self.update_state(stats_inc={"cached": 1})
+                    self.update_state(
+                        current_file=os.path.basename(source),
+                        current_folder=os.path.dirname(source),
+                        project_id=project_id,
+                        stats_inc={"cached": 1}
+                    )
                     if self.log_callback:
                         self.log_callback(f"  > [CACHE HIT] {os.path.basename(source)}")
                     return "Cache Hit"
